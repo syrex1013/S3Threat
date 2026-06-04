@@ -198,7 +198,7 @@ def build_parser() -> argparse.ArgumentParser:
     scan.add_argument(
         "--show-all",
         action="store_true",
-        help="include NONE/ERROR rows in final findings output",
+        help="include PRIVATE/NONE rows in final findings (ERROR rows always hidden)",
     )
     scan.add_argument(
         "--check-write",

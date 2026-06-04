@@ -113,11 +113,11 @@ python3 main.py --bucket-file my_targets.txt --show-all
 ### 6. S3-Compatible Storage (MinIO, Ceph, RGW)
 Scan private network ranges or custom endpoints for exposed buckets.
 ```bash
-# Scan a CIDR range for common S3 ports
-python3 main.py --cidr 10.0.0.0/24
+# Scan a CIDR range with seeds (seeds required for named bucket probing)
+python3 main.py acme backups --cidr 10.0.0.0/24
 
 # Target a specific MinIO instance
-python3 main.py --endpoint http://minio.internal:9000 --seeds backups
+python3 main.py backups data logs --endpoint http://minio.internal:9000
 ```
 
 ### 7. Security Audit & Object Review
@@ -129,8 +129,6 @@ python3 main.py --audit target-bucket --aws
 # Preview object content (syntax highlighted)
 python3 main.py --view target-bucket/config/db.json
 ```
-
----
 
 ---
 
@@ -174,6 +172,7 @@ python3 main.py [-h] [seeds ...]
 | `--max-pages` | `80` | Page fetch limit per crawl |
 | `--scrape-only` | off | Crawl only; no S3 probes |
 | `--save-seeds` | — | Write scraped seeds to file |
+| `--osint` | — | Query Shodan/Censys/ZoomEye for subdomains of DOMAIN |
 | `--random` | off | Add dictionary-based random names |
 | `--random-count` | `5000` | Random names to generate |
 | `--until-found` | off | Repeat fresh random passes until a hit appears |
@@ -186,7 +185,7 @@ python3 main.py [-h] [seeds ...]
 |------|---------|-------------|
 | `-t`, `--threads` | `60` | Concurrent workers |
 | `-o`, `--output` | — | JSON findings path |
-| `--show-all` | off | Show all statuses in final findings output |
+| `--show-all` | off | Include PRIVATE and NONE rows in final findings (ERROR always hidden) |
 | `--check-write` | off | Anonymous PUT/DELETE test on open buckets |
 
 ### Audit & AWS
@@ -258,11 +257,12 @@ With `-o findings.json`, each hit includes:
 
 ```
 S3Threat/
-├── main.py           # Entry point
+├── main.py           # Entry point, probe engine, name generation
 ├── cli.py            # Argument groups, help, version
 ├── ui.py             # Rich terminal formatting
 ├── audit.py          # 18-section security checklist
 ├── scrape.py         # Website crawler & seed extraction
+├── osint.py          # Shodan / Censys / ZoomEye seed discovery
 ├── CHECKLIST.md      # Checklist ↔ implementation map
 ├── requirements.txt
 ├── dict/
