@@ -36,7 +36,8 @@ Typical workflow:
 |------|----------------|
 | **Seed enumeration** | Permute keywords with affixes (`dev`, `prod`, `backup`, …), separators, optional years |
 | **Site scraping** | Crawl `--site-url` (depth **3** by default); extract seeds from HTML, paths, JS, JSON-LD |
-| **Random discovery** | Realistic names from `dict/english.txt`; `--until-interesting` batches until a hit |
+| **Random discovery** | Realistic names from `dict/english.txt`; one full randomized pass |
+| **Repeat-until-hit** | Keep generating fresh random passes until a hit appears |
 | **Anonymous probes** | ListBucket, GetObject, policy/ACL/CORS/website, optional PUT/DELETE test |
 | **Smart triage** | INTERESTING only when content, writes, or serious misconfigs warrant review |
 | **Security audit** | Checklist-aligned findings with critical / high / medium severity |
@@ -69,48 +70,67 @@ pip install -r requirements.txt
 
 ---
 
-## Quick start
+## Examples & Outputs
 
-### Targeted scan (engagement seeds)
-
+### 1. Targeted Seed Discovery
+Generate candidates from multiple brand keywords simultaneously.
 ```bash
-python3 main.py acme acmecorp acme-corp -o findings.json -t 80
+python3 main.py acme acme-corp acmecorp -o findings.json -t 80
+```
+**Output:**
+- Generates permutations for all three seeds (e.g., `acme-dev`, `acmecorp-backup`).
+- Displays a live table of `OPEN`, `WRITABLE`, and `PRIVATE` buckets.
+
+### 2. Website Spider & Seed Extraction
+Crawl a corporate site to find hidden S3 seeds in HTML, JS, or meta tags.
+```bash
+# Crawl depth 3, then scan
+python3 main.py --site-url https://www.google.com --depth 3
+
+# Scrape tokens only (no S3 probing)
+python3 main.py --site-url https://www.google.com --scrape-only --save-seeds google_seeds.txt
 ```
 
-### Seeds from company website
-
+### 3. OSINT-based Discovery
+Query Shodan, Censys, and ZoomEye for subdomains and leaked bucket names.
 ```bash
-# Crawl site, probe S3
-python3 main.py --site-url https://www.acme.com --depth 3 -o findings.json
-
-# Extract seeds only
-python3 main.py --site-url https://acme.com --scrape-only --save-seeds seeds.txt
-
-# Combine manual seeds + scrape
-python3 main.py acme --site-url https://www.acme.com --depth 2
+# Requires keys.json
+python3 main.py --osint google.com
 ```
 
-### Random discovery until something interesting
-
+### 4. Randomized Hunting (Dictionary Pass)
+Search for buckets using common English words + common S3 suffixes.
 ```bash
-python3 main.py --random --until-interesting --batch-size 400 -t 80
+python3 main.py --random --random-count 1000 --until-found
 ```
 
-### Full audit on one bucket
-
+### 5. Custom Bucket List
+Scan a specific list of bucket names from a text file.
 ```bash
-python3 main.py --audit my-bucket
-python3 main.py --audit my-bucket --aws --aws-profile pentest
-python3 main.py --audit my-bucket --check-write   # PUT + DELETE test (authorized only)
+python3 main.py --bucket-file my_targets.txt --show-all
 ```
 
-### View or download objects
-
+### 6. S3-Compatible Storage (MinIO, Ceph, RGW)
+Scan private network ranges or custom endpoints for exposed buckets.
 ```bash
-python3 main.py --view my-bucket
-python3 main.py --view my-bucket/backups/db.sql
-python3 main.py --download https://my-bucket.s3.us-west-2.amazonaws.com/secret.zip
+# Scan a CIDR range for common S3 ports
+python3 main.py --cidr 10.0.0.0/24
+
+# Target a specific MinIO instance
+python3 main.py --endpoint http://minio.internal:9000 --seeds backups
 ```
+
+### 7. Security Audit & Object Review
+Run a deep 18-point checklist on a specific bucket.
+```bash
+# Anonymous + AWS CLI authenticated audit
+python3 main.py --audit target-bucket --aws
+
+# Preview object content (syntax highlighted)
+python3 main.py --view target-bucket/config/db.json
+```
+
+---
 
 ---
 
@@ -136,8 +156,8 @@ A row is marked **INTERESTING** when triage or audit finds real risk (sensitive 
 python3 main.py [-h] [seeds ...]
     [--affixes FILE] [--years]
     [--site-url URL] [--depth N] [--max-pages N] [--scrape-only] [--save-seeds FILE]
-    [--random] [--random-count N] [--random-seed N]
-    [--until-interesting] [--batch-size N] [--words-dict FILE]
+    [--random] [--random-count N] [--random-seed N] [--until-found]
+    [--words-dict FILE]
     [-t THREADS] [--check-write] [-o OUTPUT] [--show-all]
     [--audit BUCKET] [--aws] [--aws-profile PROFILE]
     [--view TARGET] [--download TARGET]
@@ -156,8 +176,7 @@ python3 main.py [-h] [seeds ...]
 | `--save-seeds` | — | Write scraped seeds to file |
 | `--random` | off | Add dictionary-based random names |
 | `--random-count` | `5000` | Random names to generate |
-| `--until-interesting` | off | Keep batching until INTERESTING hit (requires `--random`) |
-| `--batch-size` | `400` | Names per batch in until-interesting mode |
+| `--until-found` | off | Repeat fresh random passes until a hit appears |
 | `--affixes` | — | Extra affix word list (one per line) |
 | `--years` | off | Append recent years to permutations |
 
@@ -167,7 +186,7 @@ python3 main.py [-h] [seeds ...]
 |------|---------|-------------|
 | `-t`, `--threads` | `60` | Concurrent workers |
 | `-o`, `--output` | — | JSON findings path |
-| `--show-all` | off | Show all statuses in final table |
+| `--show-all` | off | Show all statuses in final findings output |
 | `--check-write` | off | Anonymous PUT/DELETE test on open buckets |
 
 ### Audit & AWS
@@ -196,10 +215,11 @@ python3 main.py [-h] [seeds ...]
 S3Threat uses [Rich](https://github.com/Textualize/rich) for all output:
 
 - **Banner** and run configuration table  
-- **Live findings board** — rows append across batches (not overwritten)  
-- **Colored status** — writable (red), open, private, severity columns  
-- **Summary table** — writable / open / private / interesting counts  
-- **Audit tables** — checklist findings sorted by severity  
+- **Live findings board** - rows append as they arrive (not overwritten)
+- **Colored status** - writable (red), open, private, severity columns
+- **Stacked findings output** - each hit or misconfiguration prints as a vertical block
+- **Summary table** - writable / open / private / interesting counts
+- **Audit tables** - checklist findings sorted by severity
 
 ---
 

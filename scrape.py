@@ -34,6 +34,7 @@ STOP_WORDS = {
     "solid", "transparent", "inherit", "initial", "block", "inline", "none",
     "eee", "fff", "ccc", "ddd", "aaa", "rgb", "rgba", "url", "src", "href",
     "important", "hover", "focus", "active", "media", "screen", "print",
+    "net", "org", "io", "co",
 }
 
 _TOKEN = re.compile(r"[a-z][a-z0-9]{2,24}")

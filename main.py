@@ -11,6 +11,7 @@ import json
 import os
 import random
 import re
+import ssl
 import subprocess
 import sys
 import time
@@ -24,6 +25,7 @@ from itertools import product
 import audit as s3_audit
 import cli
 import scrape as site_scrape
+import osint
 
 try:
     from rich.live import Live
@@ -31,6 +33,12 @@ except ImportError:
     sys.exit("[!] missing dependency: pip install rich")
 
 import ui
+
+try:
+    _SSL_CTX = ssl._create_unverified_context()
+except Exception:
+    _SSL_CTX = None
+
 
 # ----------------------------------------------------------------------------
 # Smart name generation
@@ -55,6 +63,31 @@ AFFIXES = [
 
 SEPARATORS = ["-", ".", "", "_"]
 YEARS = [str(y) for y in range(2019, time.localtime().tm_year + 1)]
+_SOURCE_STOP_TOKENS = {"com", "net", "org", "io", "co", "www", "http", "https"}
+_ENVIRONMENT_WORDS = [
+    "prod", "production", "dev", "development", "stage", "staging", "test",
+    "testing", "qa", "uat", "lab", "sandbox", "main", "core", "live",
+]
+_PURPOSE_WORDS = [
+    "assets", "static", "media", "images", "files", "uploads", "docs",
+    "documents", "archive", "archives", "backup", "backups", "logs", "log",
+    "data", "database", "db", "reports", "exports", "import", "builds",
+    "artifacts", "terraform-state", "tfstate", "cloudtrail", "security",
+    "security-archive", "guardduty", "waf-logs", "wazuh", "malware",
+    "malware-samples", "analytics", "raw-data", "processed-data",
+    "curated-data", "longterm-retention",
+]
+_REGION_WORDS = [
+    "us-east-1", "us-west-1", "us-west-2", "eu-central-1", "eu-west-1",
+    "eu-west-2", "eu-west-3", "eu-north-1", "ap-southeast-1", "ap-southeast-2",
+    "ap-northeast-1", "ap-northeast-2", "ap-south-1", "ca-central-1",
+    "sa-east-1", "me-south-1",
+]
+_PREFIX_WORDS = [
+    "aws", "s3", "cdn", "files", "assets", "media", "static", "img",
+    "images", "uploads", "download", "archive", "backup", "internal",
+    "corp", "mgt", "cloudtrail", "guardduty", "terraform", "iac", "security",
+]
 
 _VALID = re.compile(r"^[a-z0-9][a-z0-9.\-]{1,61}[a-z0-9]$")
 _IP = re.compile(r"^\d{1,3}(\.\d{1,3}){3}$")
@@ -73,20 +106,36 @@ def valid_bucket_name(name: str) -> bool:
 
 
 def generate_names(seeds, affixes, years=False):
+    """Permutations across common bucket naming patterns."""
     seeds = [s.strip().lower() for s in seeds if s.strip()]
     affix_list = list(dict.fromkeys(affixes))
     extra = YEARS if years else []
     out = set()
-    for seed in seeds:
-        out.add(seed)
-        for affix, sep in product(affix_list + extra, SEPARATORS):
-            out.add(f"{seed}{sep}{affix}")
-            out.add(f"{affix}{sep}{seed}")
-        for a1, a2 in product(["prod", "dev", "stage", "test"],
-                              ["backup", "data", "logs", "db", "assets"]):
-            out.add(f"{seed}-{a1}-{a2}")
-            out.add(f"{seed}.{a1}.{a2}")
-    return sorted(n for n in out if valid_bucket_name(n))
+    for s in seeds:
+        if valid_bucket_name(s):
+            out.add(s)
+        # seed-affix and affix-seed with all separators
+        for a in affix_list + _ENVIRONMENT_WORDS + _PURPOSE_WORDS:
+            for sep in SEPARATORS:
+                n1, n2 = f"{s}{sep}{a}", f"{a}{sep}{s}"
+                if valid_bucket_name(n1):
+                    out.add(n1)
+                if valid_bucket_name(n2):
+                    out.add(n2)
+                for y in extra:
+                    n3, n4 = f"{n1}{sep}{y}", f"{s}{sep}{y}"
+                    if valid_bucket_name(n3):
+                        out.add(n3)
+                    if valid_bucket_name(n4):
+                        out.add(n4)
+        # seed-env-purpose and seed-purpose-env (no region expansion)
+        for env in ["prod", "dev", "stage", "test"]:
+            for purpose in ["backup", "data", "logs", "db", "assets", "files", "archive"]:
+                for sep in ["-", "."]:
+                    for n in (f"{s}{sep}{env}{sep}{purpose}", f"{s}{sep}{purpose}{sep}{env}"):
+                        if valid_bucket_name(n):
+                            out.add(n)
+    return sorted(out)
 
 
 _SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
@@ -140,56 +189,186 @@ _COMMON_STEMS = (
     "private", "storage", "assets", "logs", "db", "config", "docs", "tmp",
     "archive", "download", "video", "photo", "share", "cloud", "mobile",
 )
+_RANDOM_PREFIXES = list(dict.fromkeys(_PREFIX_WORDS))
+_RANDOM_TYPES = list(dict.fromkeys(_PURPOSE_WORDS + [
+    "web", "api", "app", "mobile", "ios", "android", "build", "release",
+    "releases", "reports", "temp", "tmp", "config",
+]))
+_RANDOM_ENVIRONMENTS = list(dict.fromkeys(_ENVIRONMENT_WORDS))
+_RANDOM_REGIONS = list(_REGION_WORDS)
 
 
-def random_word_pool(word_list, rng, max_words=6000):
-    """Short, plausible bucket stems — not obscure multi-word dictionary combos."""
+def _seed_source_tokens(seed_sources):
+    """Derive bucket-relevant source tokens from seed/domain strings."""
+    tokens = []
+    for seed in seed_sources or []:
+        s = seed.strip().lower()
+        if not s:
+            continue
+        s = re.sub(r"^https?://", "", s)
+        s = s.split("/", 1)[0]
+        s = s.split(":", 1)[0]
+        if valid_bucket_name(s):
+            tokens.append(s)
+
+        parts = [p for p in re.split(r"[.\-_]+", s) if p]
+        if not parts:
+            continue
+        for part in parts:
+            if part in _SOURCE_STOP_TOKENS:
+                continue
+            if valid_bucket_name(part):
+                tokens.append(part)
+        if len(parts) >= 2:
+            joined = "".join(parts[:2])
+            dashed = f"{parts[0]}-{parts[1]}"
+            for candidate in (joined, dashed):
+                if valid_bucket_name(candidate):
+                    tokens.append(candidate)
+    return list(dict.fromkeys(tokens))
+
+
+def random_word_pool(word_list, rng, max_words=2000, seed_sources=None):
+    """Return source-aware random pools for bucket candidate generation."""
+    seed_words = _seed_source_tokens(seed_sources)
     short = [w for w in word_list if 4 <= len(w) <= 8 and valid_bucket_name(w)]
     if len(short) > max_words:
         short = rng.sample(short, max_words)
     stems = [w for w in _COMMON_STEMS if valid_bucket_name(w)]
     extra = [w for w in _RANDOM_AFFIXES if valid_bucket_name(w)]
-    return list(dict.fromkeys(stems + short + extra))
+    prefixes = [w for w in _RANDOM_PREFIXES if valid_bucket_name(w)]
+    types = [w for w in _RANDOM_TYPES if valid_bucket_name(w)]
+    envs = [w for w in _RANDOM_ENVIRONMENTS if valid_bucket_name(w)]
+    regions = [w for w in _RANDOM_REGIONS if valid_bucket_name(w)]
+    return {
+        "seed": seed_words,
+        "common": list(dict.fromkeys(stems + extra)),
+        "prefixes": prefixes,
+        "types": types,
+        "envs": envs,
+        "regions": regions,
+        "dict": short,
+    }
 
 
-def generate_random_names(word_list, count, rng=None, exclude=None):
-    """Random names biased toward real-world bucket patterns (short words + affixes)."""
-    rng = rng or random.SystemRandom()
-    pool = random_word_pool(word_list, rng)
-    if not pool:
+def _pick_weighted_base(rng, sources):
+    seed_pool = sources.get("seed", [])
+    common_pool = sources.get("common", [])
+    dict_pool = sources.get("dict", [])
+    fallback = seed_pool or common_pool or dict_pool
+    if not fallback:
+        return None
+
+    roll = rng.random()
+    if seed_pool and roll < 0.60:
+        return rng.choice(seed_pool)
+    if common_pool and roll < 0.95:
+        return rng.choice(common_pool)
+    return rng.choice(dict_pool or fallback)
+
+
+def generate_random_names(word_list, count, rng=None, exclude=None, sources=None):
+    """
+    Advanced randomized bucket discovery.
+    Uses industry patterns: CloudBrute/S3Scanner style tiered mutations.
+    """
+    rng = rng or random.Random()
+    if sources is None:
+        sources = random_word_pool(word_list, rng)
+    if not any(sources.get(k) for k in ("seed", "common", "dict")):
         return []
     exclude = exclude or set()
+
     affixes = _RANDOM_AFFIXES
     years = _RANDOM_YEARS
+    seps = ["-", ".", ""]
+    prefixes = sources.get("prefixes", list(_RANDOM_PREFIXES))
+    types = sources.get("types", list(_RANDOM_TYPES))
+    envs = sources.get("envs", list(_RANDOM_ENVIRONMENTS))
+    regions = sources.get("regions", list(_RANDOM_REGIONS))
 
     out = set()
+    if count >= 10:
+        simple_pool = list(dict.fromkeys(
+            sources.get("seed", [])
+            + sources.get("common", [])
+            + prefixes
+            + types
+            + envs
+        ))
+        simple_candidates = []
+        for base in simple_pool:
+            if valid_bucket_name(base):
+                simple_candidates.append(base)
+            for suffix in ("s3", "bucket", "files", "assets", "static"):
+                for sep in ("-", ""):
+                    candidate = f"{base}{sep}{suffix}"
+                    if valid_bucket_name(candidate):
+                        simple_candidates.append(candidate)
+
+        simple_candidates = [
+            n for n in dict.fromkeys(simple_candidates)
+            if n not in exclude
+        ]
+        if simple_candidates:
+            quota = min(len(simple_candidates), max(1, count // 5))
+            out.update(rng.sample(simple_candidates, quota))
+
     attempts = 0
-    limit = max(count * 40, 2000)
+    limit = max(count * 50, 10000)
+    
     while len(out) < count and attempts < limit:
         attempts += 1
         roll = rng.random()
-        if roll < 0.50:
-            name = rng.choice(pool)
-            if rng.random() < 0.15:
-                name = f"{name}{rng.randint(1, 9999)}"
-        elif roll < 0.78:
-            w, a = rng.choice(pool), rng.choice(affixes)
-            sep = rng.choice(["-", "", "."])
-            name = f"{w}{sep}{a}" if rng.random() < 0.55 else f"{a}{sep}{w}"
-        elif roll < 0.84:
-            name = f"{rng.choice(pool)}-{rng.choice(years)}"
-        elif roll < 0.94:
-            w1, w2 = rng.choice(pool), rng.choice(pool)
-            if w1 == w2:
-                continue
-            sep = rng.choice(["-", ""])
-            name = f"{w1}{sep}{w2}"
+
+        base = _pick_weighted_base(rng, sources)
+        if not base:
+            break
+
+        # 1. High-signal source + environment/type/region combinations.
+        if roll < 0.40:
+            sep = rng.choice(seps)
+            env = rng.choice(envs)
+            typ = rng.choice(types)
+            if rng.random() < 0.45 and regions:
+                region = rng.choice(regions)
+                name = f"{base}{sep}{typ}{sep}{env}{sep}{region}"
+            elif rng.random() < 0.5:
+                name = f"{base}{sep}{env}{sep}{typ}"
+            else:
+                name = f"{base}{sep}{typ}{sep}{env}"
+
+        # 2. High-signal source + bucket affixes.
+        elif roll < 0.64:
+            a = rng.choice(affixes)
+            sep = rng.choice(seps)
+            name = f"{base}{sep}{a}" if rng.random() < 0.6 else f"{a}{sep}{base}"
+
+        # 3. Infrastructure prefixes commonly seen in public buckets.
+        elif roll < 0.82:
+            prefix = rng.choice(prefixes)
+            sep = rng.choice(seps)
+            name = f"{prefix}{sep}{base}"
+
+        # 4. Source + year / digits / region.
+        elif roll < 0.92:
+            if rng.random() < 0.5:
+                name = f"{base}{rng.choice(seps)}{rng.choice(years)}"
+            elif regions and rng.random() < 0.5:
+                name = f"{base}{rng.choice(seps)}{rng.choice(regions)}"
+            else:
+                name = f"{base}{rng.randint(1, 9999)}"
+
+        # 5. Two-token bucket names and dotted variants.
         else:
-            w = rng.choice(pool)
-            a1, a2 = rng.sample(affixes, 2)
-            name = f"{w}-{a1}-{a2}"
+            other = _pick_weighted_base(rng, sources)
+            if other is None or other == base:
+                other = rng.choice(envs + types + affixes + regions)
+            name = f"{base}.{other}" if rng.random() < 0.7 else f"{base}-{other}"
+
         if valid_bucket_name(name) and name not in exclude:
             out.add(name)
+            
     return sorted(out)
 
 
@@ -326,12 +505,57 @@ def _interesting_from_audit(audit_findings, base_interesting):
     return base_interesting
 
 
+def generate_exploit_command(check: str, detail: str, bucket: str, region: str = "") -> str:
+    """Generate POC exploit command for a given finding."""
+    check_lower = check.lower()
+    detail_lower = detail.lower()
+    bucket_url = f"{bucket}.s3.amazonaws.com"
+    if region and region != "us-east-1":
+        bucket_url = f"{bucket}.s3.{region}.amazonaws.com"
+
+    # Anonymous ListBucket
+    if "anonymous listbucket" in check_lower:
+        return f"aws s3 ls s3://{bucket} --no-sign-request"
+
+    # Anonymous PutObject/Write
+    if "anonymous putobject" in check_lower or "put" in check_lower and "object" in check_lower:
+        return f"echo 'pwned' > /tmp/test.txt && aws s3 cp /tmp/test.txt s3://{bucket}/ --no-sign-request"
+
+    # Anonymous DeleteObject
+    if "anonymous deleteobject" in check_lower or "delete" in check_lower and "object" in check_lower:
+        return f"aws s3 rm s3://{bucket}/OBJECT_KEY --no-sign-request"
+
+    # Public GetObject
+    if "anonymous getobject" in check_lower or "public read" in detail_lower:
+        return f"aws s3 cp s3://{bucket}/OBJECT_KEY /tmp/ --no-sign-request"
+
+    # Public policy
+    if "public policy" in detail_lower or "policy readable" in detail_lower:
+        return f"curl https://{bucket_url}/?policy"
+
+    # Public ACL
+    if "public acl" in detail_lower or "acl readable" in detail_lower:
+        return f"curl https://{bucket_url}/?acl"
+
+    # Public CORS
+    if "cors" in check_lower:
+        return f"curl https://{bucket_url}/?cors"
+
+    # Website hosting
+    if "website" in check_lower:
+        return f"curl http://{bucket}.s3-website-{region or 'us-east-1'}.amazonaws.com/"
+
+    # Default fallback
+    return f"aws s3 ls s3://{bucket} --no-sign-request"
+
+
 # ----------------------------------------------------------------------------
 # S3 probing
 # ----------------------------------------------------------------------------
 
 UA = "S3Threat/1.0 (authorized-assessment)"
-TIMEOUT = 10
+TIMEOUT = 8.0
+TIMEOUT_FAST = 2.0  # Faster timeout for --until-found / CIDR mode
 VIEW_MAX_BYTES = 256 * 1024
 DOWNLOAD_MAX_BYTES = 50 * 1024 * 1024
 DOWNLOAD_DIR = "downloads"
@@ -357,45 +581,46 @@ class Result:
     note: str = ""
 
 
-def _host(bucket, region):
+def _host(bucket, region, endpoint=None):
+    if endpoint:
+        # Support both path-style and vhost-style if endpoint is provided
+        if "{bucket}" in endpoint:
+            return endpoint.format(bucket=bucket, region=region or "us-east-1")
+        return f"{endpoint.rstrip('/')}/{bucket}"
     if region and region != "us-east-1":
         return f"https://{bucket}.s3.{region}.amazonaws.com"
     return f"https://{bucket}.s3.amazonaws.com"
 
 
-def _object_url(bucket, region, key):
-    return f"{_host(bucket, region)}/{urllib.parse.quote(key, safe='/')}"
+def _website_host(bucket, region="us-east-1", endpoint=None):
+    if endpoint:
+        return _host(bucket, region, endpoint)
+    return f"http://{bucket}.s3-website-{region}.amazonaws.com"
 
 
-def _request(url, method="GET"):
+def _object_url(bucket, region, key, endpoint=None):
+    return f"{_host(bucket, region, endpoint)}/{urllib.parse.quote(key, safe='/')}"
+
+
+def _request(url, method="GET", timeout=None):
     req = urllib.request.Request(url, method=method, headers={"User-Agent": UA})
-    return urllib.request.urlopen(req, timeout=TIMEOUT)
+    to = timeout if timeout is not None else TIMEOUT
+    if url.lower().startswith("https://"):
+        return urllib.request.urlopen(req, timeout=to, context=_SSL_CTX)
+    return urllib.request.urlopen(req, timeout=to)
 
 
-def _region_of(bucket):
-    """Detect bucket region. Uses GET — S3 often returns 404 on HEAD for real buckets."""
-    urls = (
-        f"https://{bucket}.s3.amazonaws.com/?max-keys=1",
-        f"https://s3.amazonaws.com/{bucket}/?max-keys=1",
-    )
-    for url in urls:
-        try:
-            resp = _request(url)
-            resp.read(512)
-            reg = resp.headers.get("x-amz-bucket-region", "us-east-1")
-            return reg, resp.status
-        except urllib.error.HTTPError as e:
-            reg = e.headers.get("x-amz-bucket-region", "")
-            if e.code == 404:
-                continue
-            if e.code in (403, 401):
-                return reg or "us-east-1", e.code
-            if e.code == 400 and reg:
-                return reg, 403
-            return reg, e.code
-        except (urllib.error.URLError, TimeoutError, OSError):
-            return "", None
-    return "", 404
+def _region_of(bucket, timeout=None, endpoint=None):
+    if endpoint:
+        return "us-east-1", 200
+    url = f"https://s3.amazonaws.com/{bucket}/"
+    try:
+        resp = _request(url, method="HEAD", timeout=timeout)
+        return resp.headers.get("x-amz-bucket-region", "us-east-1"), 200
+    except urllib.error.HTTPError as e:
+        return e.headers.get("x-amz-bucket-region", ""), e.code
+    except (urllib.error.URLError, TimeoutError, OSError):
+        return "", None
 
 
 def _parse_listing(xml_bytes, key_limit=LIST_MAX_KEYS):
@@ -433,10 +658,10 @@ def _object_count_label(key_count, listed, truncated):
     return str(len(listed)) if listed else "0"
 
 
-def _fetch_bucket_subresource(host, subresource, max_bytes=65536):
+def _fetch_bucket_subresource(host, subresource, max_bytes=65536, timeout=None):
     """Fetch ?policy, ?acl, ?cors, ?website, etc. Returns text or None."""
     try:
-        resp = _request(host + f"/?{subresource}")
+        resp = _request(host + f"/?{subresource}", timeout=timeout)
         body = resp.read(max_bytes)
         if resp.status == 200 and body:
             return body.decode("utf-8", errors="replace")
@@ -445,24 +670,40 @@ def _fetch_bucket_subresource(host, subresource, max_bytes=65536):
     return None
 
 
-def _object_readable(host, key):
+def _object_readable(host, key, timeout=None):
     url = host.rstrip("/") + "/" + urllib.parse.quote(key, safe="/")
+    to = timeout if timeout is not None else TIMEOUT
     try:
-        resp = _request(url, method="HEAD")
+        resp = _request(url, method="HEAD", timeout=timeout)
         return 200 <= resp.status < 300
     except urllib.error.HTTPError as e:
-        return e.code == 200
+        if e.code == 200:
+            return True
+        try:
+            req = urllib.request.Request(
+                url,
+                method="GET",
+                headers={"User-Agent": UA, "Range": "bytes=0-0"},
+            )
+            if url.lower().startswith("https://"):
+                resp = urllib.request.urlopen(req, timeout=to, context=_SSL_CTX)
+            else:
+                resp = urllib.request.urlopen(req, timeout=to)
+            resp.read(1)
+            return 200 <= resp.status < 300
+        except (urllib.error.HTTPError, urllib.error.URLError, TimeoutError, OSError):
+            return False
     except (urllib.error.URLError, TimeoutError, OSError):
         return False
 
 
-def _probe_public_reads(host, status, sample_keys):
+def _probe_public_reads(host, status, sample_keys, max_keys=20, timeout=None):
     keys = list(sample_keys[:8])
     if status != "OPEN":
         keys.extend(k for k in COMMON_PROBE_KEYS if k not in keys)
     readable = []
-    for key in keys[:20]:
-        if _object_readable(host, key):
+    for key in keys[:max_keys]:
+        if _object_readable(host, key, timeout=timeout):
             readable.append(key)
     return readable
 
@@ -470,30 +711,32 @@ def _probe_public_reads(host, status, sample_keys):
 _WRITE_TEST_KEY = "security-test/s3-threat-write-test.txt"
 
 
-def check_write(bucket, region):
-    url = _object_url(bucket, region, _WRITE_TEST_KEY)
+def check_write(bucket, region, timeout=None, endpoint=None):
+    url = _object_url(bucket, region, _WRITE_TEST_KEY, endpoint=endpoint)
+    to = timeout if timeout is not None else TIMEOUT
     try:
         req = urllib.request.Request(
             url, method="PUT", data=b"authorized-test",
             headers={"User-Agent": UA, "Content-Type": "text/plain"},
         )
-        resp = urllib.request.urlopen(req, timeout=TIMEOUT)
+        resp = urllib.request.urlopen(req, timeout=to)
         return 200 <= resp.status < 300
     except (urllib.error.HTTPError, urllib.error.URLError, OSError):
         return False
 
 
-def check_delete(bucket, region):
-    url = _object_url(bucket, region, _WRITE_TEST_KEY)
+def check_delete(bucket, region, timeout=None, endpoint=None):
+    url = _object_url(bucket, region, _WRITE_TEST_KEY, endpoint=endpoint)
+    to = timeout if timeout is not None else TIMEOUT
     try:
         req = urllib.request.Request(url, method="DELETE", headers={"User-Agent": UA})
-        resp = urllib.request.urlopen(req, timeout=TIMEOUT)
+        resp = urllib.request.urlopen(req, timeout=to)
         return 200 <= resp.status < 300
     except (urllib.error.HTTPError, urllib.error.URLError, OSError):
         return False
 
 
-def _apply_security_audit(r, do_write=False, aws_profile=None, use_aws=False):
+def _apply_security_audit(r, do_write=False, aws_profile=None, use_aws=False, timeout=None, endpoint=None):
     if not r.url or r.status in ("NONE", "ERROR"):
         return
     host = r.url.rstrip("/")
@@ -502,10 +745,13 @@ def _apply_security_audit(r, do_write=False, aws_profile=None, use_aws=False):
         if "listable" not in mc:
             mc.append("listable")
 
-    policy_text = _fetch_bucket_subresource(host, "policy")
-    acl_text = _fetch_bucket_subresource(host, "acl")
-    cors_text = _fetch_bucket_subresource(host, "cors")
-    website_xml = _fetch_bucket_subresource(host, "website")
+    if r.note.startswith("list endpoint returned 404") or (endpoint and not r.bucket):
+        policy_text = acl_text = cors_text = website_xml = None
+    else:
+        policy_text = _fetch_bucket_subresource(host, "policy", timeout=timeout)
+        acl_text = _fetch_bucket_subresource(host, "acl", timeout=timeout)
+        cors_text = _fetch_bucket_subresource(host, "cors", timeout=timeout)
+        website_xml = _fetch_bucket_subresource(host, "website", timeout=timeout)
 
     if policy_text and ("Statement" in policy_text or '"Effect"' in policy_text):
         mc.append("public-policy")
@@ -516,14 +762,16 @@ def _apply_security_audit(r, do_write=False, aws_profile=None, use_aws=False):
     if website_xml and "IndexDocument" in website_xml:
         mc.append("website")
 
-    readable = _probe_public_reads(host, r.status, r.sample_keys)
+    readable = list(r.sample_keys) if "public-read" in mc else _probe_public_reads(
+        host, r.status, r.sample_keys, timeout=timeout
+    )
     if readable:
         mc.append("public-read")
 
     writable = r.status == "WRITABLE" or "writable" in mc
     deletable = False
     if do_write and writable:
-        deletable = check_delete(r.bucket, r.region)
+        deletable = check_delete(r.bucket, r.region, timeout=timeout, endpoint=endpoint)
         if deletable:
             mc.append("deletable")
 
@@ -572,6 +820,7 @@ class Target:
     bucket: str
     region: str = ""
     key: str = ""
+    endpoint: str = ""
 
 
 _S3_VHOST = re.compile(
@@ -779,26 +1028,47 @@ def download_target(spec, out_dir=DOWNLOAD_DIR, max_bytes=DOWNLOAD_MAX_BYTES):
     )
 
 
-def probe(bucket, do_write=False, aws_profile=None, use_aws=False):
+def probe(bucket, do_write=False, aws_profile=None, use_aws=False, timeout=None, endpoint=None):
     r = Result(bucket=bucket)
-    region, code = _region_of(bucket)
+    region, code = _region_of(bucket, timeout=timeout, endpoint=endpoint)
     r.region = region
 
     if code is None:
         r.status, r.note = "ERROR", "request failed / timeout"
         return r
     if code == 404:
-        r.status = "NONE"
-        return r
-    if code in (403, 401):
+        host = _host(bucket, region, endpoint=endpoint)
+        readable = []
+        if "." in bucket and not endpoint:
+            website_host = _website_host(bucket, endpoint=endpoint)
+            readable = _probe_public_reads(
+                website_host, "PRIVATE", [], max_keys=3
+            )
+            if readable:
+                host = website_host
+        if readable:
+            r.status = "PRIVATE"
+            r.note = "list endpoint returned 404; public object probe succeeded"
+            r.url = host + "/"
+            r.sample_keys = readable
+            r.object_urls = [
+                host.rstrip("/") + "/" + urllib.parse.quote(k, safe="/")
+                for k in readable[:10]
+            ]
+            r.misconfigs = ["public-read"]
+        else:
+            r.status = "NONE"
+            return r
+    elif code in (403, 401):
         r.status = "PRIVATE"
         r.note = "exists, anonymous access denied"
-        r.url = _host(bucket, region) + "/"
+        host = _host(bucket, region, endpoint=endpoint)
+        r.url = host if bucket == "" else host + "/"
     else:
-        host = _host(bucket, region)
-        r.url = host + "/"
+        host = _host(bucket, region, endpoint=endpoint)
+        r.url = host if bucket == "" else host + "/"
         try:
-            resp = _request(host + f"/?max-keys={LIST_MAX_KEYS}")
+            resp = _request(host + f"/?max-keys={LIST_MAX_KEYS}", timeout=timeout)
             body = resp.read()
             if resp.status == 200 and b"ListBucketResult" in body:
                 keys, sizes, key_count, truncated = _parse_listing(body)
@@ -806,7 +1076,7 @@ def probe(bucket, do_write=False, aws_profile=None, use_aws=False):
                 r.sample_keys = keys
                 r.sample_sizes = sizes
                 r.sample_bytes = sum(sizes.values())
-                r.object_urls = [_object_url(bucket, region, k) for k in keys[:10]]
+                r.object_urls = [_object_url(bucket, region, k, endpoint=endpoint) for k in keys[:10]]
                 r.object_count = _object_count_label(key_count, keys, truncated)
                 r.note = "anonymous listing enabled"
                 r.misconfigs = ["listable"]
@@ -819,12 +1089,12 @@ def probe(bucket, do_write=False, aws_profile=None, use_aws=False):
             r.status, r.note = "ERROR", str(e)
 
     if do_write and r.status == "OPEN":
-        if check_write(bucket, region):
+        if check_write(bucket, region, timeout=timeout, endpoint=endpoint):
             r.status = "WRITABLE"
             r.misconfigs = list(dict.fromkeys(r.misconfigs + ["writable"]))
             r.note += "; anonymous PUT accepted"
 
-    _apply_security_audit(r, do_write=do_write, aws_profile=aws_profile, use_aws=use_aws)
+    _apply_security_audit(r, do_write=do_write, aws_profile=aws_profile, use_aws=use_aws, timeout=timeout, endpoint=endpoint)
     exposed = bool(r.misconfigs) or r.status in ("OPEN", "WRITABLE")
     r.interest, r.reasons, base_interesting = triage(
         bucket, r.status, r.sample_keys, r.misconfigs, exposed,
@@ -844,6 +1114,8 @@ def probe(bucket, do_write=False, aws_profile=None, use_aws=False):
 
 
 def _show_in_table(r, show_all):
+    if r.status == "ERROR":
+        return False
     return show_all or r.status in ("OPEN", "WRITABLE", "PRIVATE") or r.interesting
 
 
@@ -858,7 +1130,9 @@ class FindingsBoard:
 
     def add(self, r):
         self.results.append(r)
-        if not _show_in_table(r, self.show_all):
+        # Live panel should only show actual hits/interesting findings to keep
+        # the display clean and synchronized with the stats line.
+        if r.status not in ("OPEN", "WRITABLE", "PRIVATE") and not r.interesting:
             return
         if r.bucket in self._live_buckets:
             return
@@ -866,11 +1140,11 @@ class FindingsBoard:
         self.live_hits.append(r)
         self.live_hits.sort(key=_findings_sort_key)
 
-    def stats_line(self, probed, batch=0):
+    def stats_line(self, probed, rate=None):
         hits = sum(1 for r in self.results
                    if r.status in ("OPEN", "WRITABLE", "PRIVATE"))
         interesting = sum(r.interesting for r in self.results)
-        return ui.stats_line(probed, hits, interesting, batch)
+        return ui.stats_line(probed, hits, interesting, rate=rate)
 
 
 def _findings_sort_key(r):
@@ -883,30 +1157,98 @@ def _sorted_findings(results, show_all):
     return sorted(visible, key=_findings_sort_key)
 
 
-def _run_probes(names, args, board, seen, progress, task, live=None):
+def _has_actionable_result(results):
+    return any(
+        r.status in ("OPEN", "WRITABLE", "PRIVATE") or r.interesting
+        for r in results
+    )
+
+
+def _should_stop_until_found(result):
+    """Stop on the first existing bucket or any higher-signal exposure."""
+    return result.status in ("OPEN", "WRITABLE", "PRIVATE") or result.interesting
+
+
+def _scan_rate(start_time, completed):
+    elapsed = max(time.monotonic() - start_time, 0.001)
+    return completed / elapsed
+
+
+def _build_candidate_names(
+    seed_list,
+    affixes,
+    *,
+    args,
+    word_list,
+    random_pool,
+    seen,
+    attempt: int = 0,
+    seed_mode: str = "full",
+):
+    names = set()
+    if seed_list:
+        if seed_mode == "priority":
+            names.update(_seed_source_tokens(seed_list))
+        else:
+            names.update(generate_names(seed_list, affixes, years=args.years))
+    if args.random:
+        if args.random_count < 1:
+            raise ValueError("--random-count must be at least 1")
+        if not random_pool:
+            raise ValueError("random word list produced no valid candidates")
+        base = args.random_seed if args.random_seed is not None else 0
+        rng = random.Random(base + attempt * 10007)
+        names.update(generate_random_names(
+            word_list,
+            args.random_count,
+            rng=rng,
+            exclude=seen,
+            sources=random_pool,
+        ))
+    names.difference_update(seen)
+    return sorted(names)
+
+
+def _run_probes(names, args, board, seen, progress, task, live=None, stop_event=None):
+    start_time = time.monotonic()
     todo = [n for n in names if n not in seen]
     for n in todo:
         seen.add(n)
     if not todo:
         return []
     batch_results = []
+    
+    # Persistent executor is handled in main() for until-found, 
+    # but for compatibility we can still run a batch here if needed.
     with cf.ThreadPoolExecutor(max_workers=args.threads) as ex:
         futures = {
             ex.submit(probe, n, args.check_write, args.aws_profile, args.aws): n
             for n in todo
         }
         for fut in cf.as_completed(futures):
-            r = fut.result()
-            batch_results.append(r)
-            board.add(r)
-            progress.advance(task, 1)
-            if live is not None:
-                live.update(ui.live_scan_group(
-                    board.stats_line(len(seen)),
-                    progress,
-                    board.live_hits,
-                    MISCONFIG_LABELS,
-                ))
+            if stop_event and stop_event.is_set():
+                break
+            try:
+                r = fut.result()
+                batch_results.append(r)
+                board.add(r)
+                progress.advance(task, 1)
+                if live is not None:
+                    live.update(ui.live_scan_group(
+                        board.stats_line(
+                            len(board.results),
+                            rate=_scan_rate(start_time, len(board.results)),
+                        ),
+                        progress,
+                        board.live_hits,
+                        MISCONFIG_LABELS,
+                    ))
+                if args.until_found and _should_stop_until_found(r):
+                    if stop_event:
+                        stop_event.set()
+                    break
+            except Exception:
+                continue
     return batch_results
 
 
@@ -918,7 +1260,31 @@ def _write_output(path, results):
     ui.success(f"Findings written to [bold cyan]{path}[/]")
 
 
+def _cidr_to_ips(cidr):
+    """Generator for IP addresses from CIDR notation without external dependencies."""
+    try:
+        if "/" not in cidr:
+            yield cidr
+            return
+        base, bits = cidr.split("/")
+        bits = int(bits)
+        parts = [int(p) for p in base.split(".")]
+        if len(parts) != 4 or not (0 <= bits <= 32): return
+        
+        start = (parts[0] << 24) | (parts[1] << 16) | (parts[2] << 8) | parts[3]
+        mask = (0xFFFFFFFF << (32 - bits)) & 0xFFFFFFFF
+        net_start = start & mask
+        num_hosts = 1 << (32 - bits)
+        
+        for i in range(num_hosts):
+            curr = net_start + i
+            yield f"{(curr >> 24) & 0xFF}.{(curr >> 16) & 0xFF}.{(curr >> 8) & 0xFF}.{curr & 0xFF}"
+    except Exception:
+        return
+
+
 def main():
+    import threading
     args, ap = cli.parse_args()
     if args is None:
         ui.print_cli_help(ap, prog=cli.PROG, version=cli.VERSION)
@@ -928,7 +1294,8 @@ def main():
         ui.print_banner(cli.VERSION)
         try:
             r = probe(args.audit, do_write=args.check_write,
-                      aws_profile=args.aws_profile, use_aws=args.aws)
+                      aws_profile=args.aws_profile, use_aws=args.aws,
+                      endpoint=args.endpoint)
             ui.print_audit_report(r, s3_audit.SEVERITY_ORDER)
             if r.url:
                 ui.info(f"URL: [cyan underline]{r.url}[/]")
@@ -937,7 +1304,7 @@ def main():
         return
 
     if args.view and args.download:
-        ap.error("use only one of --view or --download")
+        ui.die("use only one of --view or --download")
     if args.view:
         try:
             view_target(args.view)
@@ -952,10 +1319,13 @@ def main():
             ui.die(str(e))
         return
 
-    if args.until_interesting and not args.random:
-        ap.error("--until-interesting requires --random")
-    if not args.seeds and not args.random and not args.site_url:
-        ap.error("provide seeds, --site-url, or --random")
+    # Discovery banner
+    ui.print_banner(cli.VERSION)
+
+    if not args.seeds and not args.random and not args.site_url and not args.bucket_file and not args.cidr and not args.endpoint:
+        ui.die("provide seeds, --site-url, --random, --bucket-file, --cidr, or --endpoint")
+    if args.until_found and not args.random:
+        ui.die("--until-found requires --random")
 
     affixes = list(AFFIXES)
     if args.affixes:
@@ -965,8 +1335,7 @@ def main():
     scraped_seeds = []
     if args.site_url:
         if args.depth < 0:
-            ap.error("--depth must be >= 0")
-        ui.print_banner(cli.VERSION)
+            ui.die("--depth must be >= 0")
         try:
             scrape_result = site_scrape.scrape_site(
                 args.site_url,
@@ -992,40 +1361,88 @@ def main():
         if args.scrape_only:
             return
 
+    osint_seeds = []
+    if args.osint:
+        ui.info(f"Querying OSINT APIs for domain: [bold cyan]{args.osint}[/]")
+        osint_seeds, osint_errors = osint.discover_seeds(args.osint)
+        ui.print_osint_report(args.osint, osint_seeds, osint_errors)
+        if args.save_seeds:
+            with open(args.save_seeds, "a", encoding="utf-8") as fh:
+                fh.write("\n".join(osint_seeds) + "\n")
+            ui.success(f"OSINT seeds appended to [bold cyan]{args.save_seeds}[/]")
+
+    flat_buckets = []
+    if args.bucket_file:
+        try:
+            with open(args.bucket_file, "r") as fh:
+                flat_buckets = [ln.strip() for ln in fh if ln.strip()]
+        except OSError as e:
+            ui.die(f"failed to read bucket file: {e}")
+
+    compat_endpoints = []
+    if args.endpoint:
+        compat_endpoints.append(args.endpoint)
+    
+    if args.cidr:
+        ui.info(f"Expanding CIDR [bold cyan]{args.cidr}[/] for S3-compatible endpoints...")
+        count = 0
+        for ip in _cidr_to_ips(args.cidr):
+            for port in [80, 443, 9000, 7480, 8080]:
+                scheme = "https" if port == 443 else "http"
+                compat_endpoints.append(f"{scheme}://{ip}:{port}")
+                count += 1
+                if count >= 25000: # 25k endpoints * ~30 bytes ~ 7.5MB
+                    break
+            if count >= 25000:
+                ui.warn("Endpoint list capped at 25,000 for memory safety.")
+                break
+
     board = FindingsBoard(show_all=args.show_all)
     seen = set()
     all_results = []
     word_list = load_word_dictionary(args.words_dict) if args.random else []
-    dict_size = len(word_list) if args.random else 0
 
-    seed_list = list(args.seeds) + scraped_seeds
-    if args.until_interesting:
+    seed_list = list(args.seeds) + scraped_seeds + osint_seeds
+    random_sources = None
+    if args.random:
+        base = args.random_seed if args.random_seed is not None else 0
+        random_sources = random_word_pool(
+            word_list,
+            random.Random(base),
+            seed_sources=seed_list,
+        )
+    if args.until_found:
         mode = (
-            f"[bold]until interesting[/]  batch [bold]{args.batch_size}[/]  "
-            f"dict [bold]{dict_size}[/] words  workers [bold]{args.threads}[/]"
+            f"[bold]repeat until hit[/]  random [bold]{args.random_count}[/] "
+            f"workers [bold]{args.threads}[/]"
         )
         if seed_list:
             mode += f"  seeds:{len(seed_list)}"
     else:
-        names = set()
-        if seed_list:
-            names.update(generate_names(seed_list, affixes, years=args.years))
-        if args.random:
-            if args.random_count < 1:
-                ap.error("--random-count must be at least 1")
-            rng = random.Random(args.random_seed)
-            names.update(generate_random_names(
-                word_list, args.random_count, rng=rng, exclude=seen,
-            ))
-        names = sorted(names)
+        names = _build_candidate_names(
+            seed_list,
+            affixes,
+            args=args,
+            word_list=word_list,
+            random_pool=random_sources,
+            seen=seen,
+        )
+        if flat_buckets:
+            for fb in flat_buckets:
+                if fb not in seen:
+                    names.append(fb)
+                    seen.add(fb)
+
         mode = f"[bold]{len(names)}[/] candidates"
         if seed_list:
             mode += f"  seeds:{len(seed_list)}"
-            if scraped_seeds:
-                mode += f" (scraped:{len(scraped_seeds)})"
+        if flat_buckets:
+            mode += f"  flat:{len(flat_buckets)}"
+        if compat_endpoints:
+            mode += f"  endpoints:{len(compat_endpoints)}"
         if args.random:
             mode += f"  random:{args.random_count}"
-    ui.print_banner(cli.VERSION)
+
     ui.print_run_config(
         mode,
         threads=args.threads,
@@ -1035,64 +1452,151 @@ def main():
     ui.rule("Scan")
 
     progress = ui.make_progress()
+    stop_event = threading.Event()
+    scan_start = time.monotonic()
 
     with Live(
         ui.live_scan_group(
-            board.stats_line(0), progress, board.live_hits, MISCONFIG_LABELS,
+            board.stats_line(0, rate=0.0), progress, board.live_hits, MISCONFIG_LABELS,
         ),
         console=ui.console,
         refresh_per_second=8,
         transient=False,
     ) as live:
-        if args.until_interesting:
-            found_interesting = False
-            if seed_list:
-                pre_names = generate_names(seed_list, affixes, years=args.years)
-                task = progress.add_task("seed targets", total=len(pre_names))
-                batch_results = _run_probes(
-                    pre_names, args, board, seen, progress, task, live=live,
-                )
-                all_results.extend(batch_results)
-                found_interesting = any(r.interesting for r in batch_results)
-            if not found_interesting:
-                batch_num = 0
-                task = progress.add_task("batch 1", total=args.batch_size)
-                while True:
-                    batch_num += 1
-                    base = (args.random_seed if args.random_seed is not None else 0)
-                    rng = random.Random(base + batch_num * 10007)
-                    raw = generate_random_names(word_list, args.batch_size * 4, rng=rng)
-                    batch_names = [n for n in raw if n not in seen][:args.batch_size]
-                    if not batch_names:
-                        progress.update(
-                            task,
-                            description=f"[yellow]batch {batch_num}: no new names[/]",
-                        )
+        if args.until_found:
+            all_results = []
+            attempt = 0
+            task = progress.add_task("probing", total=0)
+            # Shared executor for all passes
+            with cf.ThreadPoolExecutor(max_workers=args.threads) as ex:
+                while not stop_event.is_set():
+                    attempt += 1
+                    names = _build_candidate_names(
+                        seed_list,
+                        affixes,
+                        args=args,
+                        word_list=word_list,
+                        random_pool=random_sources,
+                        seen=seen,
+                        attempt=attempt,
+                        seed_mode="priority",
+                    )
+                    if not names:
+                        progress.update(task, description=f"pass {attempt}: no new names")
+                        if attempt > 20: # Sanity break
+                            break
                         continue
+                    for n in names:
+                        seen.add(n)
+                    
                     progress.update(
-                        task, total=len(batch_names), completed=0,
-                        description=f"batch {batch_num}",
+                        task,
+                        total=progress.tasks[task].total + len(names),
+                        description=f"pass {attempt}",
                     )
-                    batch_results = _run_probes(
-                        batch_names, args, board, seen, progress, task, live=live,
-                    )
-                    all_results.extend(batch_results)
-                    if any(r.interesting for r in batch_results):
-                        found_interesting = True
-                        break
-            if found_interesting:
-                ui.print_found_interesting()
-        else:
-            task = progress.add_task("probing", total=len(names))
-            all_results = _run_probes(
-                names, args, board, seen, progress, task, live=live,
-            )
+                    
+                    seen_batch = set()
+                    futures = {
+                        ex.submit(probe, n, args.check_write, args.aws_profile, args.aws, TIMEOUT_FAST): n
+                        for n in names
+                    }
+                    for fut in cf.as_completed(futures):
+                        if stop_event.is_set():
+                            break
+                        try:
+                            r = fut.result()
+                            if r.bucket in seen_batch: continue # safety
+                            seen_batch.add(r.bucket)
+                            
+                            all_results.append(r)
+                            board.add(r)
+                            progress.advance(task, 1)
+                            
+                            # Always update UI so stats (probed, speed) stay synced
+                            live.update(ui.live_scan_group(
+                                board.stats_line(
+                                    len(board.results),
+                                    rate=_scan_rate(scan_start, len(board.results)),
+                                ),
+                                progress,
+                                board.live_hits,
+                                MISCONFIG_LABELS,
+                            ))
 
-    ui.print_findings_table(
+                            if _should_stop_until_found(r):
+                                stop_event.set()
+                                # DECISIVE: cancel everything else
+                                for f in futures:
+                                    f.cancel()
+                                break
+                        except Exception:
+                            continue
+                    
+                    if stop_event.is_set():
+                        break
+        else:
+            # For custom endpoints, if no seeds are provided, we should at least probe
+            # the root to verify the service.
+            probe_targets = list(names)
+            if not probe_targets and compat_endpoints:
+                probe_targets = [""]
+
+            total_tasks = 0
+            if names: # Only AWS scan if we have names
+                total_tasks += len(names)
+            if compat_endpoints:
+                total_tasks += len(probe_targets) * len(compat_endpoints)
+            
+            task = progress.add_task("probing", total=total_tasks)
+            
+            # 1. Standard AWS scan (only if names exist)
+            all_results = []
+            if names:
+                all_results = _run_probes(
+                    names, args, board, set(), progress, task, live=live, stop_event=stop_event
+                )
+            
+            # 2. S3-compatible endpoints — one shared pool for all (endpoint, bucket) pairs
+            if compat_endpoints and not stop_event.is_set():
+                scan_start = time.monotonic()
+                board.results = []
+                endpoint_results = []
+                progress.update(task, description="probing endpoints")
+                with cf.ThreadPoolExecutor(max_workers=args.threads) as ex:
+                    futures = {
+                        ex.submit(
+                            probe, n, args.check_write, args.aws_profile, args.aws,
+                            timeout=TIMEOUT_FAST, endpoint=endpoint,
+                        ): (n, endpoint)
+                        for endpoint in compat_endpoints
+                        for n in probe_targets
+                    }
+                    for fut in cf.as_completed(futures):
+                        if stop_event.is_set():
+                            break
+                        try:
+                            r = fut.result()
+                            endpoint_results.append(r)
+                            board.add(r)
+                            progress.advance(task, 1)
+                            live.update(ui.live_scan_group(
+                                board.stats_line(
+                                    len(board.results),
+                                    rate=_scan_rate(scan_start, len(board.results)),
+                                ),
+                                progress,
+                                board.live_hits,
+                                MISCONFIG_LABELS,
+                            ))
+                        except Exception:
+                            progress.advance(task, 1)
+                            continue
+                all_results.extend(endpoint_results)
+    ui.print_findings_stack(
         _sorted_findings(all_results, args.show_all),
         MISCONFIG_LABELS,
     )
-    ui.print_summary(all_results, len(seen))
+    ui.print_summary(all_results, len(all_results))
     if args.output:
         _write_output(args.output, all_results)
 

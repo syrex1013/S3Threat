@@ -228,8 +228,13 @@ def print_cli_help(parser, *, prog: str, version: str) -> None:
     )
     modes.add_row(
         "Random hunt",
-        f"{prog} --random --until-interesting",
-        "Batch dictionary names until INTERESTING hit",
+        f"{prog} --random --random-count 5000",
+        "One full pass over randomized candidate names",
+    )
+    modes.add_row(
+        "Repeat until hit",
+        f"{prog} --random --until-found",
+        "Keep scanning fresh random passes until a hit appears",
     )
     modes.add_row(
         "Audit",
@@ -330,6 +335,27 @@ def print_run_config(
             ("AWS CLI audit", "[bold green]on[/]" if aws else "[dim]off[/]"),
         ],
     )
+
+
+def error(message: str) -> None:
+    console.print(f"[bold red]![/] {message}")
+
+
+def print_osint_report(domain: str, seeds: list[str], errors: list[str]) -> None:
+    kv_table(
+        "OSINT Discovery",
+        [
+            ("Domain", f"[cyan underline]{domain}[/]"),
+            ("APIs", "[bold]Shodan, ZoomEye, Censys[/]"),
+            ("Seeds found", f"[bold green]{len(seeds)}[/]"),
+            ("Errors", f"[red]{len(errors)}[/]" if errors else "0"),
+        ],
+        border="blue",
+    )
+    if seeds:
+        print_seeds_table(seeds, title="Discovered seeds")
+    for err in errors:
+        warn(err)
 
 
 def print_scrape_report(
@@ -445,6 +471,10 @@ def hit_detail_lines(r, misconfig_labels: dict[str, str]) -> list[str]:
             f"  {severity_cell(f['severity'])}  "
             f"[dim]{f.get('section', '')}[/]  {f.get('check', '')}"
         )
+        # Add exploit command
+        import main
+        cmd = main.generate_exploit_command(f["check"], f["detail"], r.bucket, r.region)
+        lines.append(f"    [green]POC:[/] [dim]{cmd}[/]")
     if r.url:
         lines.append(f"  [cyan underline]{r.url}[/]")
     if r.object_urls:
@@ -553,31 +583,33 @@ def result_row_cells(r, misconfig_labels: dict[str, str], *, compact: bool = Fal
     )
 
 
-def print_findings_table(
+def print_findings_stack(
     results: list,
     misconfig_labels: dict[str, str],
     *,
     title: str = "S3 Recon Findings",
 ) -> None:
-    """Print one findings table (sorted, with URLs for accessible buckets)."""
+    """Print findings as vertical blocks, one result under another."""
     if not results:
         info("No buckets to display.")
         return
-    w = _usable_width()
-    t = new_findings_table(title=title)
-    compact = getattr(t, "_s3_compact", False)
-    for r in results:
-        t.add_row(*result_row_cells(r, misconfig_labels, compact=compact))
-    console.print(t, width=w)
+    console.print(Panel.fit(Text(title, style="bold cyan"), border_style="blue"))
+    for i, r in enumerate(results):
+        if i:
+            console.print()
+        print_hit(r, misconfig_labels)
 
 
-def stats_line(probed: int, hits: int, interesting: int, batch: int = 0) -> str:
-    batch_s = f"  [cyan]batch[/] [bold]{batch}[/]" if batch else ""
+def stats_line(probed: int, hits: int, interesting: int, rate: float | None = None) -> str:
+    speed = ""
+    if rate is not None:
+        speed = f"   [green]speed[/] [bold]{rate:.1f}/s[/]"
     return (
-        f"[bold cyan]S3Threat[/]{batch_s}   "
+        f"[bold cyan]S3Threat[/]   "
         f"[dim]probed[/] [bold]{probed}[/]   "
         f"[yellow]hits[/] [bold]{hits}[/]   "
         f"[magenta]interesting[/] [bold]{interesting}[/]"
+        f"{speed}"
     )
 
 
@@ -660,6 +692,17 @@ def print_audit_report(r, severity_order: tuple[str, ...]) -> None:
         )
     console.print(t, width=w)
 
+    # Print exploit commands for each finding
+    import main
+    console.print()
+    console.print("[bold yellow]POC Exploit Commands:[/]")
+    for f in sorted(
+        r.audit_findings,
+        key=lambda x: (order.get(x["severity"], 9), x["section"]),
+    ):
+        cmd = main.generate_exploit_command(f["check"], f["detail"], r.bucket, r.region)
+        console.print(f"  [dim]•[/] [cyan]{f["check"]}[/]: [green]{cmd}[/]")
+
 
 def print_summary(results: list, probed: int) -> None:
     crit = sum(r.status == "WRITABLE" for r in results)
@@ -729,11 +772,6 @@ def print_summary(results: list, probed: int) -> None:
     for k, v in rows:
         t.add_row(k, v)
     console.print(t, width=min(52, _usable_width()))
-
-
-def print_found_interesting() -> None:
-    console.print()
-    success("Interesting bucket found — stopping scan.")
 
 
 def print_file_saved(path: str, nbytes: int) -> None:

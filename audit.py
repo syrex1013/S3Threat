@@ -37,13 +37,13 @@ class AuditFinding:
 # ---------------------------------------------------------------------------
 
 PROBE_KEYS = [
+    "index.html", "robots.txt", "error.html",
     ".env", ".env.production", ".env.local", "config.json", "config.yml",
     "credentials.json", "secrets.json", "settings.py", "application.yml",
     "backup.zip", "backup.tar.gz", "backup.sql", "dump.sql", "database.sql",
     "db.sql", "data.sql", "prod.sql", "production.sql",
     "id_rsa", "id_dsa", ".pem", "server.key", "private.key", "cert.pem",
     ".kube/config", "wp-config.php", ".git/HEAD", ".git/config",
-    "robots.txt", "index.html", "error.html",
     "access.log", "debug.log", "app.log", "logs/access.log",
     "terraform.tfstate", "terraform.tfstate.backup",
     "aws_credentials", ".aws/credentials",

@@ -28,8 +28,11 @@ EXAMPLES
   Scrape only — build wordlist for other tools
     %(prog)s --site-url https://acme.com --scrape-only --save-seeds seeds.txt
 
-  Continuous random hunt until high-value exposure
-    %(prog)s --random --until-interesting --batch-size 400
+  Full random discovery over one candidate set
+    %(prog)s --random --random-count 5000
+
+  Repeat random discovery until a bucket is found
+    %(prog)s --random --until-found --random-count 5000
 
   Single-bucket checklist (anonymous + optional AWS CLI)
     %(prog)s --audit target-bucket --aws --aws-profile assess
@@ -111,6 +114,11 @@ def build_parser() -> argparse.ArgumentParser:
         help="crawl --site-url only; print/save seeds without S3 probes",
     )
     recon.add_argument(
+        "--osint",
+        metavar="DOMAIN",
+        help="query Shodan, Censys, ZoomEye for subdomains of DOMAIN to find seeds",
+    )
+    recon.add_argument(
         "--save-seeds",
         metavar="FILE",
         help="write scraped seeds to file (one per line)",
@@ -145,21 +153,29 @@ def build_parser() -> argparse.ArgumentParser:
         help="RNG seed for reproducible --random output",
     )
     recon.add_argument(
-        "--until-interesting",
+        "--until-found",
         action="store_true",
-        help="with --random: batch until an INTERESTING finding (live table)",
-    )
-    recon.add_argument(
-        "--batch-size",
-        type=int,
-        default=400,
-        metavar="N",
-        help="names per batch for --until-interesting (default: 400)",
+        help="with --random: repeat full passes until a hit/misconfig is found",
     )
     recon.add_argument(
         "--words-dict",
         metavar="FILE",
         help="custom wordlist for --random (default: dict/english.txt)",
+    )
+    recon.add_argument(
+        "--bucket-file",
+        metavar="FILE",
+        help="load flat list of bucket names from file (one per line)",
+    )
+    recon.add_argument(
+        "--cidr",
+        metavar="CIDR",
+        help="scan network for S3-compatible endpoints (MinIO, RGW, etc.)",
+    )
+    recon.add_argument(
+        "--endpoint",
+        metavar="URL",
+        help="custom S3 endpoint URL for S3-compatible storage",
     )
 
     # --- scan ---
@@ -182,7 +198,7 @@ def build_parser() -> argparse.ArgumentParser:
     scan.add_argument(
         "--show-all",
         action="store_true",
-        help="include NONE/ERROR rows in final results table",
+        help="include NONE/ERROR rows in final findings output",
     )
     scan.add_argument(
         "--check-write",
