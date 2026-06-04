@@ -5,6 +5,7 @@ S3Threat command-line interface — argument groups and help text.
 from __future__ import annotations
 
 import argparse
+import sys
 import textwrap
 
 VERSION = "1.1.0"
@@ -261,6 +262,13 @@ def build_parser() -> argparse.ArgumentParser:
 
 def parse_args(argv=None):
     ap = build_parser()
+
+    if argv is None:
+        argv = sys.argv[1:]
+
+    if not argv:
+        argv = ["--help"]
+
     args = ap.parse_args(argv)
     if args.help:
         return None, ap
