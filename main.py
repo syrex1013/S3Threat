@@ -848,25 +848,23 @@ def _show_in_table(r, show_all):
 
 
 class FindingsBoard:
-    """Live findings table — append rows across batches without redrawing from scratch."""
+    """Accumulate probe results for live stats, hit feed, and final table."""
 
     def __init__(self, show_all=False):
         self.show_all = show_all
         self.results = []
-        self.table = ui.new_findings_table()
-        self._rows_by_bucket = {}
+        self.live_hits = []
+        self._live_buckets = set()
 
     def add(self, r):
         self.results.append(r)
         if not _show_in_table(r, self.show_all):
             return
-        if r.bucket in self._rows_by_bucket:
+        if r.bucket in self._live_buckets:
             return
-        self._rows_by_bucket[r.bucket] = len(self.table.rows)
-        compact = getattr(self.table, "_s3_compact", False)
-        self.table.add_row(
-            *ui.result_row_cells(r, MISCONFIG_LABELS, compact=compact)
-        )
+        self._live_buckets.add(r.bucket)
+        self.live_hits.append(r)
+        self.live_hits.sort(key=_findings_sort_key)
 
     def stats_line(self, probed, batch=0):
         hits = sum(1 for r in self.results
@@ -875,11 +873,14 @@ class FindingsBoard:
         return ui.stats_line(probed, hits, interesting, batch)
 
 
-def summary_table(results, show_all):
-    board = FindingsBoard(show_all=show_all)
-    for r in sorted(results, key=lambda x: (-x.interest, x.bucket)):
-        board.add(r)
-    return board.table
+def _findings_sort_key(r):
+    status_order = {"WRITABLE": 0, "OPEN": 1, "PRIVATE": 2, "ERROR": 3, "NONE": 4}
+    return (not r.interesting, -r.interest, status_order.get(r.status, 9), r.bucket)
+
+
+def _sorted_findings(results, show_all):
+    visible = [r for r in results if _show_in_table(r, show_all)]
+    return sorted(visible, key=_findings_sort_key)
 
 
 def _run_probes(names, args, board, seen, progress, task, live=None):
@@ -900,8 +901,11 @@ def _run_probes(names, args, board, seen, progress, task, live=None):
             board.add(r)
             progress.advance(task, 1)
             if live is not None:
-                live.update(ui.live_group(
-                    board.stats_line(len(seen)), progress, board.table,
+                live.update(ui.live_scan_group(
+                    board.stats_line(len(seen)),
+                    progress,
+                    board.live_hits,
+                    MISCONFIG_LABELS,
                 ))
     return batch_results
 
@@ -1033,9 +1037,12 @@ def main():
     progress = ui.make_progress()
 
     with Live(
-        ui.live_group(board.stats_line(0), progress, board.table),
+        ui.live_scan_group(
+            board.stats_line(0), progress, board.live_hits, MISCONFIG_LABELS,
+        ),
         console=ui.console,
-        refresh_per_second=6,
+        refresh_per_second=8,
+        transient=False,
     ) as live:
         if args.until_interesting:
             found_interesting = False
@@ -1081,8 +1088,10 @@ def main():
                 names, args, board, seen, progress, task, live=live,
             )
 
-    ui.rule("Results")
-    ui.console.print(summary_table(all_results, args.show_all))
+    ui.print_findings_table(
+        _sorted_findings(all_results, args.show_all),
+        MISCONFIG_LABELS,
+    )
     ui.print_summary(all_results, len(seen))
     if args.output:
         _write_output(args.output, all_results)
