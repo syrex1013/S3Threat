@@ -1,0 +1,36 @@
+# Bytecode
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+
+# Virtual environments
+.venv/
+venv/
+env/
+
+# Tool output
+findings.json
+findings*.json
+downloads/
+*.log
+
+# OS / editor
+.DS_Store
+Thumbs.db
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
+
+# Packaging
+dist/
+build/
+*.egg-info/
+
+# Secrets
+.env
+.env.*
+*.pem
+credentials.json
