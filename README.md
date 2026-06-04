@@ -1,47 +1,52 @@
 # S3Threat
 
-**Anonymous Amazon S3 bucket discovery and misconfiguration assessment for authorized security engagements.**
+<p align="center">
+  <strong>Anonymous S3 bucket discovery, exposure triage, and security auditing</strong><br>
+  For authorized penetration tests and cloud security assessments
+</p>
 
-S3Threat generates high-signal bucket name candidates, probes the public S3 API without credentials, classifies exposure, and surfaces only findings that warrant manual review. It is designed for penetration testers, cloud security engineers, and red teams operating under explicit written authorization.
+<p align="center">
+  <a href="LICENSE"><img src="https://img.shields.io/badge/license-MIT-blue.svg" alt="License"></a>
+  <a href="https://github.com/syrex1013/S3Threat"><img src="https://img.shields.io/badge/python-3.10+-blue.svg" alt="Python"></a>
+</p>
+
+---
+
+## Overview
+
+S3Threat discovers Amazon S3 buckets without AWS credentials, classifies anonymous exposure, runs an [18-point security checklist](CHECKLIST.md), and presents results in a **Rich** terminal UI (live tables, severity colors, progress bars).
+
+Typical workflow:
+
+1. **Generate candidates** from brand seeds, a crawled company website, or a random dictionary.
+2. **Probe** buckets concurrently over the public S3 API.
+3. **Triage** so only meaningful findings are marked **INTERESTING** (not every public listing).
+4. **Audit**, **view**, or **download** exposed objects for manual review.
 
 ---
 
 ## Features
 
-| Capability | Description |
-|------------|-------------|
-| **Target-scoped enumeration** | Permute seeds with environment affixes (`dev`, `prod`, `backup`, `assets`, …), separators, and optional year suffixes |
-| **Dictionary-driven discovery** | `--random` mode uses `dict/english.txt` with realistic naming patterns (short stems, affixes, years) |
-| **Continuous batch scanning** | `--until-interesting` appends hits to a single live table across batches—no overwritten output |
-| **Misconfiguration probes** | Anonymous ListBucket, GetObject, bucket policy, bucket ACL, and optional write tests |
-| **Smart triage** | `INTERESTING` flag based on sensitive keys, extensions, and exposure—not every open listing |
-| **Object intelligence** | Per-bucket object counts and sampled byte totals in the results table |
-| **Inspect & export** | `--view` and `--download` for buckets, keys, or full HTTPS URLs |
-| **Structured output** | JSON export for pipelines and reporting |
-
----
-
-## Classification model
-
-| Status | Meaning |
-|--------|---------|
-| `WRITABLE` | Anonymous `PutObject` succeeded (critical) |
-| `OPEN` | Anonymous `ListBucket` succeeded |
-| `PRIVATE` | Bucket exists; anonymous access denied |
-| `NONE` | No bucket at that name (404) |
-| `ERROR` | Network, timeout, or unexpected HTTP response |
-
-**Misconfiguration tags:** `listable`, `writable`, `public-policy`, `public-acl`, `public-read`
-
-A bucket is marked **INTERESTING** only when triage detects meaningful risk—for example sensitive object names, readable policies, or anonymous writes—not merely because listing is enabled.
+| Area | What it does |
+|------|----------------|
+| **Seed enumeration** | Permute keywords with affixes (`dev`, `prod`, `backup`, …), separators, optional years |
+| **Site scraping** | Crawl `--site-url` (depth **3** by default); extract seeds from HTML, paths, JS, JSON-LD |
+| **Random discovery** | Realistic names from `dict/english.txt`; `--until-interesting` batches until a hit |
+| **Anonymous probes** | ListBucket, GetObject, policy/ACL/CORS/website, optional PUT/DELETE test |
+| **Smart triage** | INTERESTING only when content, writes, or serious misconfigs warrant review |
+| **Security audit** | Checklist-aligned findings with critical / high / medium severity |
+| **AWS CLI mode** | Optional `--aws` for encryption, versioning, logging, Public Access Block, etc. |
+| **Rich UI** | Banner, config tables, live findings board, syntax-highlighted `--view` |
+| **Export** | JSON with `audit_findings`, `severity`, sample keys, and sizes |
 
 ---
 
 ## Requirements
 
-- Python **3.10+**
+- **Python 3.10+**
 - Network access to `*.amazonaws.com`
-- [Rich](https://github.com/Textualize/rich) (`pip install rich`)
+- **[Rich](https://github.com/Textualize/rich)** (terminal UI)
+- **AWS CLI** (optional, only for `--aws` / authenticated checklist items)
 
 ```bash
 pip install -r requirements.txt
@@ -49,122 +54,227 @@ pip install -r requirements.txt
 
 ---
 
+## Installation
+
+```bash
+git clone https://github.com/syrex1013/S3Threat.git
+cd S3Threat
+pip install -r requirements.txt
+```
+
+---
+
 ## Quick start
 
-### Seed-based scan (recommended for engagements)
+### Targeted scan (engagement seeds)
 
 ```bash
 python3 main.py acme acmecorp acme-corp -o findings.json -t 80
 ```
 
-### Random discovery with live table until a high-value hit
+### Seeds from company website
+
+```bash
+# Crawl site, probe S3
+python3 main.py --site-url https://www.acme.com --depth 3 -o findings.json
+
+# Extract seeds only
+python3 main.py --site-url https://acme.com --scrape-only --save-seeds seeds.txt
+
+# Combine manual seeds + scrape
+python3 main.py acme --site-url https://www.acme.com --depth 2
+```
+
+### Random discovery until something interesting
 
 ```bash
 python3 main.py --random --until-interesting --batch-size 400 -t 80
 ```
 
-### Inspect or download a finding
+### Full audit on one bucket
 
 ```bash
-python3 main.py --view acme-prod-backup
-python3 main.py --view acme-prod-backup/exports/customers.csv
-python3 main.py --download https://bucket.s3.us-west-2.amazonaws.com/path/to/object.zip
+python3 main.py --audit my-bucket
+python3 main.py --audit my-bucket --aws --aws-profile pentest
+python3 main.py --audit my-bucket --check-write   # PUT + DELETE test (authorized only)
+```
+
+### View or download objects
+
+```bash
+python3 main.py --view my-bucket
+python3 main.py --view my-bucket/backups/db.sql
+python3 main.py --download https://my-bucket.s3.us-west-2.amazonaws.com/secret.zip
 ```
 
 ---
 
-## Usage
+## How buckets are classified
+
+| Status | Meaning |
+|--------|---------|
+| `WRITABLE` | Anonymous upload succeeded — **critical** |
+| `OPEN` | Anonymous `ListBucket` succeeded |
+| `PRIVATE` | Bucket exists; anonymous access denied |
+| `NONE` | No bucket at that name |
+| `ERROR` | Timeout or unexpected HTTP response |
+
+**Misconfiguration tags:** `listable`, `writable`, `deletable`, `public-policy`, `public-acl`, `public-read`, `public-cors`, `website`
+
+A row is marked **INTERESTING** when triage or audit finds real risk (sensitive keys, public policy, anonymous writes, etc.) — not merely because listing is enabled.
+
+---
+
+## Command reference
 
 ```
-usage: main.py [-h] [--affixes AFFIXES] [--years] [--random]
-               [--random-count N] [--random-seed N] [--until-interesting]
-               [--batch-size N] [--words-dict FILE] [-t THREADS]
-               [--check-write] [-o OUTPUT] [--show-all] [--view TARGET]
-               [--download TARGET] [--download-dir DIR] [--max-download BYTES]
-               [seeds ...]
+python3 main.py [-h] [seeds ...]
+    [--affixes FILE] [--years]
+    [--site-url URL] [--depth N] [--max-pages N] [--scrape-only] [--save-seeds FILE]
+    [--random] [--random-count N] [--random-seed N]
+    [--until-interesting] [--batch-size N] [--words-dict FILE]
+    [-t THREADS] [--check-write] [-o OUTPUT] [--show-all]
+    [--audit BUCKET] [--aws] [--aws-profile PROFILE]
+    [--view TARGET] [--download TARGET]
+    [--download-dir DIR] [--max-download BYTES]
 ```
 
-### Discovery modes
-
-| Mode | Command |
-|------|---------|
-| Seeds only | `python3 main.py <seed> [seed ...]` |
-| Seeds + affix years | `python3 main.py acme --years` |
-| Random candidates | `python3 main.py --random --random-count 5000` |
-| Random until triage hit | `python3 main.py --random --until-interesting` |
-| Combined | `python3 main.py acme --random --random-count 2000` |
-
-### Notable flags
+### Discovery
 
 | Flag | Default | Description |
 |------|---------|-------------|
-| `-t`, `--threads` | `60` | Concurrent probe workers |
-| `-o`, `--output` | — | Write JSON findings |
-| `--check-write` | off | Non-destructive PUT probe on open buckets (**authorized only**) |
-| `--show-all` | off | Include all statuses in the final table |
-| `--words-dict` | `dict/english.txt` | Custom word list for `--random` |
-| `--download-dir` | `downloads/` | Output root for `--download` |
-| `--max-download` | 50 MiB | Per-object download cap |
+| `seeds` | — | Brand / product keywords (e.g. `acme acmecorp`) |
+| `--site-url` | — | Crawl company site for seeds |
+| `--depth` | `3` | Max link depth for crawl |
+| `--max-pages` | `80` | Page fetch limit per crawl |
+| `--scrape-only` | off | Crawl only; no S3 probes |
+| `--save-seeds` | — | Write scraped seeds to file |
+| `--random` | off | Add dictionary-based random names |
+| `--random-count` | `5000` | Random names to generate |
+| `--until-interesting` | off | Keep batching until INTERESTING hit (requires `--random`) |
+| `--batch-size` | `400` | Names per batch in until-interesting mode |
+| `--affixes` | — | Extra affix word list (one per line) |
+| `--years` | off | Append recent years to permutations |
 
-### Target formats (`--view` / `--download`)
+### Scanning & output
 
-- Bucket name: `my-bucket`
-- Bucket and key: `my-bucket/path/to/file.env`
-- Virtual-hosted URL: `https://my-bucket.s3.eu-west-1.amazonaws.com/path/to/file`
+| Flag | Default | Description |
+|------|---------|-------------|
+| `-t`, `--threads` | `60` | Concurrent workers |
+| `-o`, `--output` | — | JSON findings path |
+| `--show-all` | off | Show all statuses in final table |
+| `--check-write` | off | Anonymous PUT/DELETE test on open buckets |
+
+### Audit & AWS
+
+| Flag | Description |
+|------|-------------|
+| `--audit BUCKET` | Full checklist report for one bucket |
+| `--aws` | Run authenticated AWS CLI checks (see [CHECKLIST.md](CHECKLIST.md)) |
+| `--aws-profile` | AWS CLI profile name |
+
+### Inspect & download
+
+| Flag | Default | Description |
+|------|---------|-------------|
+| `--view TARGET` | — | Inspect bucket or object (syntax highlight for text) |
+| `--download TARGET` | — | Download object or listable bucket |
+| `--download-dir` | `downloads/` | Download output directory |
+| `--max-download` | 50 MiB | Per-file size limit |
+
+**TARGET formats:** `bucket`, `bucket/key/path`, or `https://bucket.s3.region.amazonaws.com/key`
 
 ---
 
-## Output
+## Terminal output
 
-The terminal UI provides:
+S3Threat uses [Rich](https://github.com/Textualize/rich) for all output:
 
-1. A **live findings table** that accumulates rows across batches
-2. A **progress bar** with batch and completion metrics
-3. A **summary panel** (writable / open / private / interesting counts)
-
-JSON output (`-o`) includes buckets with status `OPEN`, `WRITABLE`, `PRIVATE`, or `interesting: true`, with fields for region, URLs, sample keys, sizes, misconfigs, and triage reasons.
+- **Banner** and run configuration table  
+- **Live findings board** — rows append across batches (not overwritten)  
+- **Colored status** — writable (red), open, private, severity columns  
+- **Summary table** — writable / open / private / interesting counts  
+- **Audit tables** — checklist findings sorted by severity  
 
 ---
 
-## Project layout
+## JSON output
+
+With `-o findings.json`, each hit includes:
+
+```json
+{
+  "bucket": "acme-prod-backup",
+  "status": "OPEN",
+  "region": "us-east-1",
+  "url": "https://acme-prod-backup.s3.amazonaws.com/",
+  "sample_keys": ["backup/data.sql"],
+  "object_count": ">=25",
+  "sample_bytes": 1048576,
+  "misconfigs": ["listable", "public-read"],
+  "severity": "critical",
+  "interesting": true,
+  "audit_findings": [
+    {
+      "section": "3. Object-level exposure",
+      "check": "Anonymous GetObject",
+      "severity": "critical",
+      "detail": "..."
+    }
+  ],
+  "interest": 78,
+  "reasons": ["files: .sql", "keys: backup"]
+}
+```
+
+---
+
+## Project structure
 
 ```
 S3Threat/
-├── main.py              # CLI entry point
-├── requirements.txt     # Python dependencies
+├── main.py           # CLI entry point
+├── ui.py             # Rich terminal formatting
+├── audit.py          # 18-section security checklist
+├── scrape.py         # Website crawler & seed extraction
+├── CHECKLIST.md      # Checklist ↔ implementation map
+├── requirements.txt
 ├── dict/
-│   └── english.txt      # Word list for --random (alpha words, 3–12 chars used)
-├── downloads/           # Default --download output (gitignored)
+│   └── english.txt   # Word list for --random
+├── .github/
+│   └── FUNDING.yml
 ├── LICENSE
 └── README.md
 ```
 
 ---
 
-## Methodology notes
+## Methodology
 
-- **Existence checks** use `GET ?max-keys=1` rather than `HEAD`, because many real buckets return misleading `404` responses to anonymous `HEAD`.
-- **Random names** favor short dictionary stems and common cloud naming patterns instead of obscure multi-word combinations.
-- **Write probes** upload a single empty test object (`s3recon-authz-write-test.txt`) when `--check-write` is enabled; use only with customer approval.
+- **Bucket existence** — `GET ?max-keys=1` (anonymous `HEAD` often returns false 404s).
+- **Random names** — Short stems + common affixes (`prod`, `backup`, years), not obscure dictionary compounds.
+- **Site scrape** — Same-origin BFS; tokens from meta tags, paths, inline JS, JSON-LD, S3 hints in scripts.
+- **Write probe** — Uploads `security-test/s3-threat-write-test.txt` and attempts delete when `--check-write` is set. Use only with written authorization.
+
+Details: [CHECKLIST.md](CHECKLIST.md)
 
 ---
 
-## Legal and ethical use
+## Legal & ethical use
 
-**Use S3Threat only on AWS accounts, buckets, and infrastructure you own or are explicitly authorized to test in writing.**
+**Use S3Threat only on infrastructure you own or are explicitly authorized to test.**
 
-Unauthorized scanning may violate computer-fraud laws, cloud provider acceptable-use policies, and your employer's rules of engagement. The authors assume no liability for misuse. You are responsible for scope, consent, data handling, and reporting.
+Unauthorized scanning may violate law and cloud provider policies. You are responsible for scope, consent, and data handling. The authors assume no liability for misuse.
 
 ---
 
 ## License
 
-This project is licensed under the [MIT License](LICENSE).
+[MIT License](LICENSE) — Copyright (c) 2026 [syrex1013](https://github.com/syrex1013)
 
 ---
 
-## Author & support
+## Support
 
-Maintained by [**syrex1013**](https://github.com/syrex1013).
-
-If this tool saves you time on an engagement, consider supporting development via GitHub Sponsors (see `.github/FUNDING.yml`).
+Maintained by [**syrex1013**](https://github.com/syrex1013).  
+GitHub Sponsors: see [.github/FUNDING.yml](.github/FUNDING.yml).

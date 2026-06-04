@@ -1,21 +1,44 @@
-# Bytecode
+# Python
 __pycache__/
 *.py[cod]
 *$py.class
 *.so
+.Python
+*.egg
+*.egg-info/
+dist/
+build/
+.eggs/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+htmlcov/
+.coverage
+coverage.xml
 
 # Virtual environments
 .venv/
 venv/
 env/
+.env/
 
-# Tool output
+# S3Threat outputs
 findings.json
 findings*.json
 downloads/
+seeds.txt
+scraped-seeds*.txt
 *.log
 
-# OS / editor
+# Secrets & credentials
+.env.*
+!.env.example
+*.pem
+*.key
+credentials.json
+.aws/
+
+# OS & editors
 .DS_Store
 Thumbs.db
 .idea/
@@ -23,14 +46,10 @@ Thumbs.db
 *.swp
 *.swo
 *~
+.cursor/
 
-# Packaging
-dist/
-build/
-*.egg-info/
-
-# Secrets
-.env
-.env.*
-*.pem
-credentials.json
+# Archives & temp
+*.zip
+*.tar.gz
+tmp/
+temp/

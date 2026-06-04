@@ -21,6 +21,7 @@ Requires: rich   ->   pip install rich
 Usage:
     python3 main.py acme acme-corp acmecorp -o findings.json
     python3 main.py acme --years --check-write -t 80
+    python3 main.py --site-url https://www.example.com --depth 3
     python3 main.py --random --until-interesting --batch-size 400
     python3 main.py --view acme-prod-backup
     python3 main.py --download https://bucket.s3.amazonaws.com/key
@@ -32,6 +33,7 @@ import json
 import os
 import random
 import re
+import subprocess
 import sys
 import time
 import urllib.error
@@ -41,18 +43,15 @@ import xml.etree.ElementTree as ET
 from dataclasses import dataclass, field, asdict
 from itertools import product
 
+import audit as s3_audit
+import scrape as site_scrape
+
 try:
-    from rich.console import Console, Group
-    from rich.table import Table
-    from rich.progress import (Progress, SpinnerColumn, BarColumn, TextColumn,
-                               TimeElapsedColumn, MofNCompleteColumn)
-    from rich.panel import Panel
     from rich.live import Live
-    from rich import box
 except ImportError:
     sys.exit("[!] missing dependency: pip install rich")
 
-console = Console(highlight=False)
+import ui
 
 # ----------------------------------------------------------------------------
 # Smart name generation
@@ -240,26 +239,15 @@ SENSITIVE_TOKENS = {
 MISCONFIG_LABELS = {
     "listable": "anonymous ListBucket",
     "writable": "anonymous PutObject",
+    "deletable": "anonymous DeleteObject",
     "public-policy": "bucket policy readable",
     "public-acl": "bucket ACL readable",
     "public-read": "anonymous object GET",
+    "public-cors": "CORS configuration readable",
+    "website": "static website hosting",
 }
-COMMON_PROBE_KEYS = [
-    ".env", "config.json", "credentials.json", "secrets.json", "backup.zip",
-    "database.sql", "dump.sql", "id_rsa", "wp-config.php", ".git/HEAD",
-    "robots.txt", "index.html",
-]
+COMMON_PROBE_KEYS = s3_audit.PROBE_KEYS
 LIST_MAX_KEYS = 25
-
-
-def _format_bytes(n):
-    if n < 1024:
-        return f"{n} B"
-    if n < 1024 ** 2:
-        return f"{n / 1024:.1f} KB"
-    if n < 1024 ** 3:
-        return f"{n / 1024 ** 2:.1f} MB"
-    return f"{n / 1024 ** 3:.1f} GB"
 
 
 def _is_benign_key(key):
@@ -340,6 +328,7 @@ def triage(bucket, status, sample_keys, misconfigs, exposed):
     interesting = (
         status == "WRITABLE"
         or "writable" in misconfigs
+        or "deletable" in misconfigs
         or "public-policy" in misconfigs
         or "public-acl" in misconfigs
         or (content_score >= 12)
@@ -348,6 +337,14 @@ def triage(bucket, status, sample_keys, misconfigs, exposed):
         or (status == "OPEN" and content_score >= 18)
     )
     return score, reasons, interesting
+
+
+def _interesting_from_audit(audit_findings, base_interesting):
+    if any(f.severity == "critical" for f in audit_findings):
+        return True
+    if any(f.severity == "high" for f in audit_findings):
+        return True
+    return base_interesting
 
 
 # ----------------------------------------------------------------------------
@@ -373,6 +370,8 @@ class Result:
     object_count: str = ""
     sample_bytes: int = 0
     misconfigs: list = field(default_factory=list)
+    audit_findings: list = field(default_factory=list)
+    severity: str = "none"
     interest: int = 0
     interesting: bool = False
     reasons: list = field(default_factory=list)
@@ -455,24 +454,16 @@ def _object_count_label(key_count, listed, truncated):
     return str(len(listed)) if listed else "0"
 
 
-def _check_public_policy(host):
+def _fetch_bucket_subresource(host, subresource, max_bytes=65536):
+    """Fetch ?policy, ?acl, ?cors, ?website, etc. Returns text or None."""
     try:
-        resp = _request(host + "/?policy")
-        body = resp.read(8192)
-        return resp.status == 200 and (b"Statement" in body or b'"Effect"' in body)
+        resp = _request(host + f"/?{subresource}")
+        body = resp.read(max_bytes)
+        if resp.status == 200 and body:
+            return body.decode("utf-8", errors="replace")
     except (urllib.error.HTTPError, urllib.error.URLError, TimeoutError, OSError):
-        return False
-
-
-def _check_public_acl(host):
-    try:
-        resp = _request(host + "/?acl")
-        body = resp.read(8192)
-        return resp.status == 200 and (
-            b"AllUsers" in body or b"AuthenticatedUsers" in body
-        )
-    except (urllib.error.HTTPError, urllib.error.URLError, TimeoutError, OSError):
-        return False
+        pass
+    return None
 
 
 def _object_readable(host, key):
@@ -487,28 +478,43 @@ def _object_readable(host, key):
 
 
 def _probe_public_reads(host, status, sample_keys):
-    keys = list(sample_keys[:6])
+    keys = list(sample_keys[:8])
     if status != "OPEN":
         keys.extend(k for k in COMMON_PROBE_KEYS if k not in keys)
     readable = []
-    for key in keys[:10]:
+    for key in keys[:20]:
         if _object_readable(host, key):
             readable.append(key)
     return readable
 
 
+_WRITE_TEST_KEY = "security-test/s3-threat-write-test.txt"
+
+
 def check_write(bucket, region):
-    url = f"{_host(bucket, region)}/s3recon-authz-write-test.txt"
+    url = _object_url(bucket, region, _WRITE_TEST_KEY)
     try:
-        req = urllib.request.Request(url, method="PUT", data=b"",
-                                     headers={"User-Agent": UA})
+        req = urllib.request.Request(
+            url, method="PUT", data=b"authorized-test",
+            headers={"User-Agent": UA, "Content-Type": "text/plain"},
+        )
         resp = urllib.request.urlopen(req, timeout=TIMEOUT)
         return 200 <= resp.status < 300
     except (urllib.error.HTTPError, urllib.error.URLError, OSError):
         return False
 
 
-def _apply_misconfig_probes(r):
+def check_delete(bucket, region):
+    url = _object_url(bucket, region, _WRITE_TEST_KEY)
+    try:
+        req = urllib.request.Request(url, method="DELETE", headers={"User-Agent": UA})
+        resp = urllib.request.urlopen(req, timeout=TIMEOUT)
+        return 200 <= resp.status < 300
+    except (urllib.error.HTTPError, urllib.error.URLError, OSError):
+        return False
+
+
+def _apply_security_audit(r, do_write=False, aws_profile=None, use_aws=False):
     if not r.url or r.status in ("NONE", "ERROR"):
         return
     host = r.url.rstrip("/")
@@ -516,18 +522,70 @@ def _apply_misconfig_probes(r):
     if r.status in ("OPEN", "WRITABLE"):
         if "listable" not in mc:
             mc.append("listable")
-    if _check_public_policy(host):
+
+    policy_text = _fetch_bucket_subresource(host, "policy")
+    acl_text = _fetch_bucket_subresource(host, "acl")
+    cors_text = _fetch_bucket_subresource(host, "cors")
+    website_xml = _fetch_bucket_subresource(host, "website")
+
+    if policy_text and ("Statement" in policy_text or '"Effect"' in policy_text):
         mc.append("public-policy")
-    if _check_public_acl(host):
+    if acl_text and ("AllUsers" in acl_text or "AuthenticatedUsers" in acl_text):
         mc.append("public-acl")
+    if cors_text and "CORSRule" in cors_text:
+        mc.append("public-cors")
+    if website_xml and "IndexDocument" in website_xml:
+        mc.append("website")
+
     readable = _probe_public_reads(host, r.status, r.sample_keys)
     if readable:
         mc.append("public-read")
+
+    writable = r.status == "WRITABLE" or "writable" in mc
+    deletable = False
+    if do_write and writable:
+        deletable = check_delete(r.bucket, r.region)
+        if deletable:
+            mc.append("deletable")
+
+    anon_findings = s3_audit.run_anonymous_audit(
+        status=r.status,
+        sample_keys=r.sample_keys,
+        readable_keys=readable,
+        policy_text=policy_text,
+        acl_text=acl_text,
+        cors_text=cors_text,
+        website_xml=website_xml,
+        writable=writable,
+        deletable=deletable,
+    )
+    aws_findings = []
+    if use_aws:
+        if _aws_available():
+            aws_findings = s3_audit.run_aws_audit(r.bucket, profile=aws_profile)
+        else:
+            r.note = (r.note + "; " if r.note else "") + "aws cli not available"
+
+    findings = s3_audit.merge_findings(anon_findings, aws_findings)
+    r.audit_findings = [f.to_dict() for f in findings]
+    r.severity = s3_audit.max_severity(findings)
+    r.misconfigs = list(dict.fromkeys(mc))
+
+    if readable:
         preview = ", ".join(readable[:3])
         if len(readable) > 3:
             preview += f" (+{len(readable) - 3})"
         r.note = (r.note + "; " if r.note else "") + f"readable: {preview}"
-    r.misconfigs = list(dict.fromkeys(mc))
+
+
+def _aws_available():
+    try:
+        subprocess.run(
+            ["aws", "--version"], capture_output=True, timeout=5, check=False,
+        )
+        return True
+    except (FileNotFoundError, OSError):
+        return False
 
 
 @dataclass
@@ -646,41 +704,24 @@ def _is_textual(data, content_type=""):
 
 
 def view_target(spec):
+    ui.print_banner()
     target = resolve_target(parse_target(spec))
     if target.key:
         data, truncated, ctype = fetch_object(target, max_bytes=VIEW_MAX_BYTES)
         url = _object_url(target.bucket, target.region, target.key)
-        console.print(Panel.fit(
-            f"[bold]{target.bucket}[/] / [cyan]{target.key}[/]\n"
-            f"[dim]{url}[/]\n"
-            f"[dim]{_format_bytes(len(data))}"
-            + (" (truncated for view)" if truncated else "")
-            + (f"  {ctype}" if ctype else ""),
-            title="view", border_style="cyan",
-        ))
-        if _is_textual(data, ctype):
-            text = data.decode("utf-8", errors="replace")
-            if truncated:
-                text += "\n… [truncated]"
-            console.print(Panel(text, border_style="dim", expand=True))
-        else:
-            preview = data[:64]
-            console.print(f"[dim]binary — first 64 bytes:[/] {preview!r}")
+        ui.print_view_object(
+            target.bucket, target.key, url, data,
+            truncated=truncated, content_type=ctype or "",
+            is_textual=_is_textual(data, ctype),
+        )
         return
 
     r = probe(target.bucket, do_write=False)
-    console.print(Panel.fit(
-        f"[bold]{r.bucket}[/]  [{STATUS_STYLE[r.status][1]}]{r.status}[/]  "
-        f"[dim]{r.region}[/]  {r.note}",
-        title="bucket", border_style="cyan",
-    ))
-    if r.url:
-        console.print(f"[cyan underline]{r.url}[/]")
-    if r.misconfigs:
-        console.print("[dim]misconfig:[/] " + ", ".join(
-            MISCONFIG_LABELS.get(m, m) for m in r.misconfigs))
+    ui.print_view_bucket_header(r)
     if r.reasons:
-        console.print("[dim]triage:[/] " + "; ".join(r.reasons))
+        ui.info("Triage: " + "; ".join(r.reasons))
+    ui.rule("Audit")
+    ui.print_audit_report(r, s3_audit.SEVERITY_ORDER)
 
     keys, sizes = [], {}
     if r.status in ("OPEN", "WRITABLE"):
@@ -688,26 +729,14 @@ def view_target(spec):
     elif "public-read" in r.misconfigs:
         keys = list(r.sample_keys)
 
-    if not keys:
-        console.print("[dim]no listable objects to show[/]")
-        return
-
-    t = Table(box=box.SIMPLE, expand=True, header_style="bold")
-    t.add_column("Key", overflow="fold")
-    t.add_column("Size", justify="right", no_wrap=True)
-    for k in keys[:100]:
-        sz = sizes.get(k, 0)
-        t.add_row(k, _format_bytes(sz) if sz else "-")
-    if len(keys) > 100:
-        t.add_row(f"[dim]… {len(keys) - 100} more[/]", "")
-    console.print(t)
-    console.print(
-        f"[dim]{len(keys)} object(s) — use "
-        f"[bold]--download {target.bucket}/<key>[/] to save[/]"
-    )
+    ui.rule("Objects")
+    ui.print_objects_table(keys, sizes)
+    if keys:
+        ui.info(f"Download: [bold]--download {target.bucket}/<key>[/]")
 
 
 def download_target(spec, out_dir=DOWNLOAD_DIR, max_bytes=DOWNLOAD_MAX_BYTES):
+    ui.print_banner()
     target = resolve_target(parse_target(spec))
     os.makedirs(out_dir, exist_ok=True)
 
@@ -715,7 +744,7 @@ def download_target(spec, out_dir=DOWNLOAD_DIR, max_bytes=DOWNLOAD_MAX_BYTES):
         data, truncated, _ = fetch_object(target, max_bytes=max_bytes + 1)
         if truncated or len(data) > max_bytes:
             raise RuntimeError(
-                f"object exceeds --max-download ({_format_bytes(max_bytes)})"
+                f"object exceeds --max-download ({ui.format_bytes(max_bytes)})"
             )
         dest = os.path.join(out_dir, target.bucket, target.key.replace("/", os.sep))
         parent = os.path.dirname(dest)
@@ -723,7 +752,7 @@ def download_target(spec, out_dir=DOWNLOAD_DIR, max_bytes=DOWNLOAD_MAX_BYTES):
             os.makedirs(parent, exist_ok=True)
         with open(dest, "wb") as fh:
             fh.write(data)
-        console.print(f"[green][*][/] saved [bold]{len(data)}[/] bytes → [cyan]{dest}[/]")
+        ui.print_file_saved(dest, len(data))
         return
 
     r = probe(target.bucket, do_write=False)
@@ -737,11 +766,16 @@ def download_target(spec, out_dir=DOWNLOAD_DIR, max_bytes=DOWNLOAD_MAX_BYTES):
     if not keys:
         raise RuntimeError("no objects found to download")
 
+    ui.panel(
+        "Download",
+        f"Bucket [bold]{target.bucket}[/]  ·  [bold]{len(keys)}[/] object(s)",
+        border="green",
+    )
     saved, total = 0, 0
     for key in keys:
         sz = sizes.get(key, 0)
         if sz > max_bytes:
-            console.print(f"[yellow][!][/] skip [dim]{key}[/] ({_format_bytes(sz)} > limit)")
+            ui.print_download_skip(key, f"{ui.format_bytes(sz)} > limit")
             continue
         try:
             data, _, _ = fetch_object(
@@ -749,7 +783,7 @@ def download_target(spec, out_dir=DOWNLOAD_DIR, max_bytes=DOWNLOAD_MAX_BYTES):
                 max_bytes=max_bytes + 1,
             )
         except RuntimeError as e:
-            console.print(f"[yellow][!][/] skip [dim]{key}[/]: {e}")
+            ui.print_download_skip(key, str(e))
             continue
         dest = os.path.join(out_dir, target.bucket, key.replace("/", os.sep))
         parent = os.path.dirname(dest)
@@ -759,15 +793,14 @@ def download_target(spec, out_dir=DOWNLOAD_DIR, max_bytes=DOWNLOAD_MAX_BYTES):
             fh.write(data)
         saved += 1
         total += len(data)
-        console.print(f"[dim]↓[/] {key} ({_format_bytes(len(data))})")
+        ui.print_download_progress(key, len(data))
 
-    console.print(Panel.fit(
-        f"[green]{saved}[/] file(s), [bold]{_format_bytes(total)}[/] → [cyan]{out_dir}/{target.bucket}/[/]",
-        title="download", border_style="green",
-    ))
+    ui.print_download_complete(
+        saved, total, f"{out_dir}/{target.bucket}/",
+    )
 
 
-def probe(bucket, do_write=False):
+def probe(bucket, do_write=False, aws_profile=None, use_aws=False):
     r = Result(bucket=bucket)
     region, code = _region_of(bucket)
     r.region = region
@@ -812,87 +845,23 @@ def probe(bucket, do_write=False):
             r.misconfigs = list(dict.fromkeys(r.misconfigs + ["writable"]))
             r.note += "; anonymous PUT accepted"
 
-    _apply_misconfig_probes(r)
+    _apply_security_audit(r, do_write=do_write, aws_profile=aws_profile, use_aws=use_aws)
     exposed = bool(r.misconfigs) or r.status in ("OPEN", "WRITABLE")
-    r.interest, r.reasons, r.interesting = triage(
+    r.interest, r.reasons, base_interesting = triage(
         bucket, r.status, r.sample_keys, r.misconfigs, exposed,
     )
+    findings_objs = [
+        s3_audit.AuditFinding(**f) for f in r.audit_findings
+    ]
+    r.interesting = _interesting_from_audit(findings_objs, base_interesting)
+    if r.severity in ("critical", "high"):
+        r.interest = max(r.interest, 50 if r.severity == "critical" else 35)
     return r
 
 
 # ----------------------------------------------------------------------------
-# Presentation
+# Presentation (Rich via ui.py)
 # ----------------------------------------------------------------------------
-
-STATUS_STYLE = {
-    "WRITABLE": ("CRITICAL", "bold white on red"),
-    "OPEN":     ("OPEN",     "bold red"),
-    "PRIVATE":  ("priv",     "yellow"),
-    "ERROR":    ("error",    "dim"),
-    "NONE":     ("none",     "dim"),
-}
-
-
-def _size_count_cell(r):
-    parts = []
-    if r.object_count:
-        parts.append(f"{r.object_count} objs")
-    if r.sample_bytes:
-        parts.append(_format_bytes(r.sample_bytes) + " sampled")
-    return " · ".join(parts) if parts else "-"
-
-
-def print_hit(r):
-    label, style = STATUS_STYLE[r.status]
-    flag = "  [bold magenta]\u2605 INTERESTING[/]" if r.interesting else ""
-    mc = ", ".join(MISCONFIG_LABELS.get(m, m) for m in r.misconfigs[:3])
-    if len(r.misconfigs) > 3:
-        mc += f" (+{len(r.misconfigs) - 3})"
-    meta = _size_count_cell(r)
-    console.print(
-        f"[{style}]{label:>8}[/] [bold]{r.bucket}[/] "
-        f"[dim]{r.region or '-'}[/]  [dim]{meta}[/]{flag}"
-    )
-    if mc:
-        console.print(f"           [dim]misconfig:[/] {mc}")
-    if r.status in ("OPEN", "WRITABLE"):
-        console.print(f"           [cyan underline]{r.url}[/]")
-        for url in r.object_urls[:5]:
-            console.print(f"             [dim]\u2192[/] [cyan]{url}[/]")
-
-
-def _new_findings_table(title="S3 Recon Findings"):
-    t = Table(title=title, box=box.SIMPLE_HEAVY, header_style="bold", expand=True)
-    t.add_column("Status", no_wrap=True)
-    t.add_column("Bucket", style="bold", no_wrap=True)
-    t.add_column("Region", no_wrap=True)
-    t.add_column("Count", justify="right", no_wrap=True)
-    t.add_column("Size", justify="right", no_wrap=True)
-    t.add_column("Score", justify="right", no_wrap=True)
-    t.add_column("Misconfigs / Why", overflow="fold")
-    return t
-
-
-def _result_row_cells(r):
-    label, style = STATUS_STYLE[r.status]
-    score = f"[bold magenta]{r.interest}[/]" if r.interesting \
-        else (str(r.interest) if r.interest else "")
-    mc = ", ".join(MISCONFIG_LABELS.get(m, m) for m in r.misconfigs)
-    why = "; ".join(r.reasons)
-    parts = [p for p in (mc, why) if p]
-    detail = " — ".join(parts)
-    if r.status in ("OPEN", "WRITABLE"):
-        detail = f"[cyan underline]{r.url}[/]" + (f"  ({detail})" if detail else "")
-    elif r.url:
-        detail = (detail + "  " if detail else "") + f"[dim]{r.url}[/]"
-    count = r.object_count or ("-" if r.status not in ("OPEN", "WRITABLE") else "0")
-    size = _format_bytes(r.sample_bytes) if r.sample_bytes else "-"
-    if r.interesting:
-        count = f"[bold magenta]{count}[/]"
-    return (
-        f"[{style}]{label}[/]", r.bucket, r.region or "-",
-        count, size, score, detail,
-    )
 
 
 def _show_in_table(r, show_all):
@@ -905,7 +874,7 @@ class FindingsBoard:
     def __init__(self, show_all=False):
         self.show_all = show_all
         self.results = []
-        self.table = _new_findings_table()
+        self.table = ui.new_findings_table()
         self._rows_by_bucket = {}
 
     def add(self, r):
@@ -915,18 +884,13 @@ class FindingsBoard:
         if r.bucket in self._rows_by_bucket:
             return
         self._rows_by_bucket[r.bucket] = len(self.table.rows)
-        self.table.add_row(*_result_row_cells(r))
+        self.table.add_row(*ui.result_row_cells(r, MISCONFIG_LABELS))
 
     def stats_line(self, probed, batch=0):
         hits = sum(1 for r in self.results
                    if r.status in ("OPEN", "WRITABLE", "PRIVATE"))
         interesting = sum(r.interesting for r in self.results)
-        batch_s = f"  batch [bold]{batch}[/]" if batch else ""
-        return (
-            f"[dim]probed {probed}[/]{batch_s}  "
-            f"[yellow]{hits} hits[/]  "
-            f"[bold magenta]{interesting} interesting[/]"
-        )
+        return ui.stats_line(probed, hits, interesting, batch)
 
 
 def summary_table(results, show_all):
@@ -944,33 +908,20 @@ def _run_probes(names, args, board, seen, progress, task, live=None):
         return []
     batch_results = []
     with cf.ThreadPoolExecutor(max_workers=args.threads) as ex:
-        futures = {ex.submit(probe, n, args.check_write): n for n in todo}
+        futures = {
+            ex.submit(probe, n, args.check_write, args.aws_profile, args.aws): n
+            for n in todo
+        }
         for fut in cf.as_completed(futures):
             r = fut.result()
             batch_results.append(r)
             board.add(r)
             progress.advance(task, 1)
             if live is not None:
-                live.update(Group(board.stats_line(len(seen)), progress, board.table))
+                live.update(ui.live_group(
+                    board.stats_line(len(seen)), progress, board.table,
+                ))
     return batch_results
-
-
-def _print_summary(results, probed, title="summary"):
-    crit = sum(r.status == "WRITABLE" for r in results)
-    opn = sum(r.status == "OPEN" for r in results)
-    priv = sum(r.status == "PRIVATE" for r in results)
-    interesting = sum(r.interesting for r in results)
-    policy = sum("public-policy" in r.misconfigs for r in results)
-    acl = sum("public-acl" in r.misconfigs for r in results)
-    reads = sum("public-read" in r.misconfigs for r in results)
-    console.print(Panel.fit(
-        f"[bold white on red] {crit} WRITABLE [/]   "
-        f"[bold red]{opn} OPEN[/]   [yellow]{priv} private[/]   "
-        f"[bold magenta]{interesting} interesting \u2605[/]   "
-        f"[dim]policy:{policy} acl:{acl} read:{reads}[/]   "
-        f"[dim]{probed} probed[/]",
-        title=title, border_style="cyan",
-    ))
 
 
 def _write_output(path, results):
@@ -978,7 +929,7 @@ def _write_output(path, results):
         json.dump([asdict(r) for r in results
                    if r.status in ("OPEN", "WRITABLE", "PRIVATE") or r.interesting],
                   fh, indent=2)
-    console.print(f"[green][*][/] findings written to [bold]{path}[/]")
+    ui.success(f"Findings written to [bold cyan]{path}[/]")
 
 
 def main():
@@ -999,6 +950,16 @@ def main():
                     help="names per batch for --until-interesting (default 400)")
     ap.add_argument("--words-dict", metavar="FILE",
                     help="word list file (one word per line); default: dict/english.txt")
+    ap.add_argument("--site-url", metavar="URL",
+                    help="crawl company site and use extracted terms as bucket seeds")
+    ap.add_argument("--depth", type=int, default=3, metavar="N",
+                    help="max link depth for --site-url crawl (default 3)")
+    ap.add_argument("--max-pages", type=int, default=80, metavar="N",
+                    help="max pages to fetch when scraping (default 80)")
+    ap.add_argument("--scrape-only", action="store_true",
+                    help="only crawl --site-url and print seeds; do not probe S3")
+    ap.add_argument("--save-seeds", metavar="FILE",
+                    help="write scraped seeds to a file (one per line)")
     ap.add_argument("-t", "--threads", type=int, default=60, help="concurrent workers (default 60)")
     ap.add_argument("--check-write", action="store_true",
                     help="non-destructive write probe on OPEN buckets (authorized only)")
@@ -1012,7 +973,25 @@ def main():
                     help=f"output directory for --download (default: {DOWNLOAD_DIR})")
     ap.add_argument("--max-download", metavar="BYTES", type=int, default=DOWNLOAD_MAX_BYTES,
                     help="per-file size limit for --download")
+    ap.add_argument("--audit", metavar="BUCKET",
+                    help="run full security checklist on one bucket and print report")
+    ap.add_argument("--aws", action="store_true",
+                    help="run authenticated AWS CLI checks (§1, §7–14; requires credentials)")
+    ap.add_argument("--aws-profile", metavar="PROFILE",
+                    help="AWS CLI profile for --aws / --audit")
     args = ap.parse_args()
+
+    if args.audit:
+        ui.print_banner()
+        try:
+            r = probe(args.audit, do_write=args.check_write,
+                      aws_profile=args.aws_profile, use_aws=args.aws)
+            ui.print_audit_report(r, s3_audit.SEVERITY_ORDER)
+            if r.url:
+                ui.info(f"URL: [cyan underline]{r.url}[/]")
+        except (ValueError, RuntimeError) as e:
+            ui.die(str(e))
+        return
 
     if args.view and args.download:
         ap.error("use only one of --view or --download")
@@ -1020,25 +999,55 @@ def main():
         try:
             view_target(args.view)
         except (ValueError, RuntimeError) as e:
-            sys.exit(f"[!] {e}")
+            ui.die(str(e))
         return
     if args.download:
         try:
             download_target(args.download, out_dir=args.download_dir,
                             max_bytes=args.max_download)
         except (ValueError, RuntimeError) as e:
-            sys.exit(f"[!] {e}")
+            ui.die(str(e))
         return
 
     if args.until_interesting and not args.random:
         ap.error("--until-interesting requires --random")
-    if not args.seeds and not args.random:
-        ap.error("provide at least one seed or use --random")
+    if not args.seeds and not args.random and not args.site_url:
+        ap.error("provide seeds, --site-url, or --random")
 
     affixes = list(AFFIXES)
     if args.affixes:
         with open(args.affixes) as fh:
             affixes += [ln.strip() for ln in fh if ln.strip()]
+
+    scraped_seeds = []
+    if args.site_url:
+        if args.depth < 0:
+            ap.error("--depth must be >= 0")
+        ui.print_banner()
+        try:
+            scrape_result = site_scrape.scrape_site(
+                args.site_url,
+                depth=args.depth,
+                max_pages=args.max_pages,
+                valid_fn=valid_bucket_name,
+            )
+        except ValueError as e:
+            ui.die(str(e))
+        scraped_seeds = scrape_result.seeds
+        ui.print_scrape_report(
+            args.site_url,
+            depth=args.depth,
+            max_pages=args.max_pages,
+            pages_crawled=scrape_result.pages_crawled,
+            tokens_seen=scrape_result.tokens_seen,
+            seeds=scraped_seeds,
+        )
+        if args.save_seeds:
+            with open(args.save_seeds, "w", encoding="utf-8") as fh:
+                fh.write("\n".join(scraped_seeds) + "\n")
+            ui.success(f"Seeds saved to [bold cyan]{args.save_seeds}[/]")
+        if args.scrape_only:
+            return
 
     board = FindingsBoard(show_all=args.show_all)
     seen = set()
@@ -1046,15 +1055,18 @@ def main():
     word_list = load_word_dictionary(args.words_dict) if args.random else []
     dict_size = len(word_list) if args.random else 0
 
+    seed_list = list(args.seeds) + scraped_seeds
     if args.until_interesting:
         mode = (
             f"[bold]until interesting[/]  batch [bold]{args.batch_size}[/]  "
             f"dict [bold]{dict_size}[/] words  workers [bold]{args.threads}[/]"
         )
+        if seed_list:
+            mode += f"  seeds:{len(seed_list)}"
     else:
         names = set()
-        if args.seeds:
-            names.update(generate_names(args.seeds, affixes, years=args.years))
+        if seed_list:
+            names.update(generate_names(seed_list, affixes, years=args.years))
         if args.random:
             if args.random_count < 1:
                 ap.error("--random-count must be at least 1")
@@ -1064,58 +1076,75 @@ def main():
             ))
         names = sorted(names)
         mode = f"[bold]{len(names)}[/] candidates"
-        if args.seeds:
-            mode += f"  seeds:{len(args.seeds)}"
+        if seed_list:
+            mode += f"  seeds:{len(seed_list)}"
+            if scraped_seeds:
+                mode += f" (scraped:{len(scraped_seeds)})"
         if args.random:
             mode += f"  random:{args.random_count}"
-    console.print(Panel.fit(
-        f"{mode}   write-probe: [bold]{'on' if args.check_write else 'off'}[/]",
-        title="S3Threat", border_style="cyan",
-    ))
-
-    progress = Progress(
-        SpinnerColumn(), TextColumn("[progress.description]{task.description}"),
-        BarColumn(), MofNCompleteColumn(), TimeElapsedColumn(),
-        console=console,
+    ui.print_banner()
+    ui.print_run_config(
+        mode,
+        threads=args.threads,
+        write_probe=args.check_write,
+        aws=args.aws,
     )
+    ui.rule("Scan")
 
-    with Live(Group(board.stats_line(0), progress, board.table),
-              console=console, refresh_per_second=6) as live:
+    progress = ui.make_progress()
+
+    with Live(
+        ui.live_group(board.stats_line(0), progress, board.table),
+        console=ui.console,
+        refresh_per_second=6,
+    ) as live:
         if args.until_interesting:
-            batch_num = 0
-            task = progress.add_task("batch 1", total=args.batch_size)
-            while True:
-                batch_num += 1
-                base = (args.random_seed if args.random_seed is not None else 0)
-                rng = random.Random(base + batch_num * 10007)
-                raw = generate_random_names(word_list, args.batch_size * 4, rng=rng)
-                batch_names = [n for n in raw if n not in seen][:args.batch_size]
-                if not batch_names:
-                    progress.update(
-                        task, description=f"[yellow]batch {batch_num}: no new names[/]",
-                    )
-                    continue
-                progress.update(
-                    task, total=len(batch_names), completed=0,
-                    description=f"batch {batch_num}",
-                )
+            found_interesting = False
+            if seed_list:
+                pre_names = generate_names(seed_list, affixes, years=args.years)
+                task = progress.add_task("seed targets", total=len(pre_names))
                 batch_results = _run_probes(
-                    batch_names, args, board, seen, progress, task, live=live,
+                    pre_names, args, board, seen, progress, task, live=live,
                 )
                 all_results.extend(batch_results)
-                if any(r.interesting for r in batch_results):
-                    console.print(
-                        "\n[bold green][*][/] interesting bucket found — stopping"
+                found_interesting = any(r.interesting for r in batch_results)
+            if not found_interesting:
+                batch_num = 0
+                task = progress.add_task("batch 1", total=args.batch_size)
+                while True:
+                    batch_num += 1
+                    base = (args.random_seed if args.random_seed is not None else 0)
+                    rng = random.Random(base + batch_num * 10007)
+                    raw = generate_random_names(word_list, args.batch_size * 4, rng=rng)
+                    batch_names = [n for n in raw if n not in seen][:args.batch_size]
+                    if not batch_names:
+                        progress.update(
+                            task,
+                            description=f"[yellow]batch {batch_num}: no new names[/]",
+                        )
+                        continue
+                    progress.update(
+                        task, total=len(batch_names), completed=0,
+                        description=f"batch {batch_num}",
                     )
-                    break
+                    batch_results = _run_probes(
+                        batch_names, args, board, seen, progress, task, live=live,
+                    )
+                    all_results.extend(batch_results)
+                    if any(r.interesting for r in batch_results):
+                        found_interesting = True
+                        break
+            if found_interesting:
+                ui.print_found_interesting()
         else:
             task = progress.add_task("probing", total=len(names))
             all_results = _run_probes(
                 names, args, board, seen, progress, task, live=live,
             )
 
-    console.print()
-    _print_summary(all_results, len(seen))
+    ui.rule("Results")
+    ui.console.print(summary_table(all_results, args.show_all))
+    ui.print_summary(all_results, len(seen))
     if args.output:
         _write_output(args.output, all_results)
 
