@@ -1,33 +1,11 @@
 #!/usr/bin/env python3
 """
-S3Threat - target-scoped S3 bucket discovery for authorized assessments.
+S3Threat — S3 exposure discovery and security audit for authorized assessments.
 
-Generates candidate bucket names from target seeds, anonymously probes the S3
-API, classifies each candidate, triages findings by likely sensitivity, and
-emits directly-accessible URLs.
-
-    WRITABLE anonymous PUT accepted              -> CRITICAL
-    OPEN     anonymous ListBucket succeeds       -> listable (not auto-flagged)
-    PRIVATE  bucket exists, access denied (403)  -> confirms existence
-    NONE     bucket does not exist (404)
-
-    Also probes: public bucket policy/ACL, anonymous object GET.
-    INTERESTING flag only when content, writes, or serious misconfigs warrant review.
-
-Built for scoped engagements: seed it with YOUR target's keywords.
-
-Requires: rich   ->   pip install rich
-
-Usage:
-    python3 main.py acme acme-corp acmecorp -o findings.json
-    python3 main.py acme --years --check-write -t 80
-    python3 main.py --site-url https://www.example.com --depth 3
-    python3 main.py --random --until-interesting --batch-size 400
-    python3 main.py --view acme-prod-backup
-    python3 main.py --download https://bucket.s3.amazonaws.com/key
+Professional CLI for penetration testers and cloud security researchers.
+Run ``python3 main.py -h`` for the full Rich help screen.
 """
 
-import argparse
 import concurrent.futures as cf
 import json
 import os
@@ -44,6 +22,7 @@ from dataclasses import dataclass, field, asdict
 from itertools import product
 
 import audit as s3_audit
+import cli
 import scrape as site_scrape
 
 try:
@@ -704,7 +683,7 @@ def _is_textual(data, content_type=""):
 
 
 def view_target(spec):
-    ui.print_banner()
+    ui.print_banner(cli.VERSION)
     target = resolve_target(parse_target(spec))
     if target.key:
         data, truncated, ctype = fetch_object(target, max_bytes=VIEW_MAX_BYTES)
@@ -736,7 +715,7 @@ def view_target(spec):
 
 
 def download_target(spec, out_dir=DOWNLOAD_DIR, max_bytes=DOWNLOAD_MAX_BYTES):
-    ui.print_banner()
+    ui.print_banner(cli.VERSION)
     target = resolve_target(parse_target(spec))
     os.makedirs(out_dir, exist_ok=True)
 
@@ -884,7 +863,10 @@ class FindingsBoard:
         if r.bucket in self._rows_by_bucket:
             return
         self._rows_by_bucket[r.bucket] = len(self.table.rows)
-        self.table.add_row(*ui.result_row_cells(r, MISCONFIG_LABELS))
+        compact = getattr(self.table, "_s3_compact", False)
+        self.table.add_row(
+            *ui.result_row_cells(r, MISCONFIG_LABELS, compact=compact)
+        )
 
     def stats_line(self, probed, batch=0):
         hits = sum(1 for r in self.results
@@ -933,56 +915,13 @@ def _write_output(path, results):
 
 
 def main():
-    ap = argparse.ArgumentParser(description="Target-scoped S3 bucket discovery.")
-    ap.add_argument("seeds", nargs="*",
-                    help="target keywords (brand, domain stem, products); optional with --random")
-    ap.add_argument("--affixes", help="file with extra affix words, one per line")
-    ap.add_argument("--years", action="store_true", help="also permute with recent years")
-    ap.add_argument("--random", action="store_true",
-                    help="add random bucket names from an English word dictionary")
-    ap.add_argument("--random-count", type=int, default=5000, metavar="N",
-                    help="how many random names to generate (default 5000)")
-    ap.add_argument("--random-seed", type=int, default=None,
-                    help="RNG seed for reproducible --random name sets")
-    ap.add_argument("--until-interesting", action="store_true",
-                    help="with --random: keep batching until an interesting bucket is found")
-    ap.add_argument("--batch-size", type=int, default=400, metavar="N",
-                    help="names per batch for --until-interesting (default 400)")
-    ap.add_argument("--words-dict", metavar="FILE",
-                    help="word list file (one word per line); default: dict/english.txt")
-    ap.add_argument("--site-url", metavar="URL",
-                    help="crawl company site and use extracted terms as bucket seeds")
-    ap.add_argument("--depth", type=int, default=3, metavar="N",
-                    help="max link depth for --site-url crawl (default 3)")
-    ap.add_argument("--max-pages", type=int, default=80, metavar="N",
-                    help="max pages to fetch when scraping (default 80)")
-    ap.add_argument("--scrape-only", action="store_true",
-                    help="only crawl --site-url and print seeds; do not probe S3")
-    ap.add_argument("--save-seeds", metavar="FILE",
-                    help="write scraped seeds to a file (one per line)")
-    ap.add_argument("-t", "--threads", type=int, default=60, help="concurrent workers (default 60)")
-    ap.add_argument("--check-write", action="store_true",
-                    help="non-destructive write probe on OPEN buckets (authorized only)")
-    ap.add_argument("-o", "--output", help="write full JSON findings to this path")
-    ap.add_argument("--show-all", action="store_true", help="include PRIVATE/NONE in final table")
-    ap.add_argument("--view", metavar="TARGET",
-                    help="inspect bucket or object (bucket, bucket/key, or S3 URL)")
-    ap.add_argument("--download", metavar="TARGET",
-                    help="download object or listable bucket (bucket, bucket/key, or S3 URL)")
-    ap.add_argument("--download-dir", metavar="DIR", default=DOWNLOAD_DIR,
-                    help=f"output directory for --download (default: {DOWNLOAD_DIR})")
-    ap.add_argument("--max-download", metavar="BYTES", type=int, default=DOWNLOAD_MAX_BYTES,
-                    help="per-file size limit for --download")
-    ap.add_argument("--audit", metavar="BUCKET",
-                    help="run full security checklist on one bucket and print report")
-    ap.add_argument("--aws", action="store_true",
-                    help="run authenticated AWS CLI checks (§1, §7–14; requires credentials)")
-    ap.add_argument("--aws-profile", metavar="PROFILE",
-                    help="AWS CLI profile for --aws / --audit")
-    args = ap.parse_args()
+    args, ap = cli.parse_args()
+    if args is None:
+        ui.print_cli_help(ap, prog=cli.PROG, version=cli.VERSION)
+        return
 
     if args.audit:
-        ui.print_banner()
+        ui.print_banner(cli.VERSION)
         try:
             r = probe(args.audit, do_write=args.check_write,
                       aws_profile=args.aws_profile, use_aws=args.aws)
@@ -1023,7 +962,7 @@ def main():
     if args.site_url:
         if args.depth < 0:
             ap.error("--depth must be >= 0")
-        ui.print_banner()
+        ui.print_banner(cli.VERSION)
         try:
             scrape_result = site_scrape.scrape_site(
                 args.site_url,
@@ -1082,7 +1021,7 @@ def main():
                 mode += f" (scraped:{len(scraped_seeds)})"
         if args.random:
             mode += f"  random:{args.random_count}"
-    ui.print_banner()
+    ui.print_banner(cli.VERSION)
     ui.print_run_config(
         mode,
         threads=args.threads,

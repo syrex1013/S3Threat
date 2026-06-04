@@ -14,7 +14,12 @@
 
 ## Overview
 
-S3Threat discovers Amazon S3 buckets without AWS credentials, classifies anonymous exposure, runs an [18-point security checklist](CHECKLIST.md), and presents results in a **Rich** terminal UI (live tables, severity colors, progress bars).
+**S3Threat** is a CLI built for **penetration testers, red team operators, and cloud security researchers** performing authorized AWS assessments. It discovers S3 buckets without credentials, classifies anonymous exposure, runs an [18-point security checklist](CHECKLIST.md), and presents results in a **Rich** terminal UI (live tables, severity colors, progress bars).
+
+```bash
+python3 main.py -h    # full professional help (Rich)
+python3 main.py -V    # version
+```
 
 Typical workflow:
 
@@ -233,7 +238,8 @@ With `-o findings.json`, each hit includes:
 
 ```
 S3Threat/
-├── main.py           # CLI entry point
+├── main.py           # Entry point
+├── cli.py            # Argument groups, help, version
 ├── ui.py             # Rich terminal formatting
 ├── audit.py          # 18-section security checklist
 ├── scrape.py         # Website crawler & seed extraction
